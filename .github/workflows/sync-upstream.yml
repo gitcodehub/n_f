@@ -8,16 +8,35 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: sync-nxnative
+  cancel-in-progress: false
+
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout fork
+        uses: actions/checkout@v7
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Sync upstream main
+      - name: Add upstream
         run: |
           git remote add upstream https://github.com/seedds/nxnative.git
+
+      - name: Fetch upstream
+        run: |
           git fetch upstream main
-          git push origin upstream/main:main
+
+      - name: Merge upstream into fork
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit upstream/main
+
+      - name: Push updated main
+        run: |
+          git push origin HEAD:main
