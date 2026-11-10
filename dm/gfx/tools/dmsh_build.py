@@ -308,7 +308,22 @@ def tg_spill(msl):
     return '\n'.join(lines), total
 # textureGatherOffsets: spirv-cross's spvGatherConstOffsets passes coffsets[i] from a loop to gather(), whose offset Metal takes only as a constant expression. At -O1 the loop stays and
 # the compiler takes it anyway: the gathers then read texels at offsets that differ between lanes and between runs, with no error. agl's NDSR upscaler builds its input tile this way, so
-# some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out
+# some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out.
+# Offsets that form a 2x2 square (b, b+(1,0), b+(0,1), b+(1,1), in any order) take one gather at b instead: each offset's texel is the (i0, j0) corner of its own footprint, and with
+# integer offsets those corners are the four texels of b's footprint, each wrapped on its own either way (Metal's order: x (i0, j1), y (i1, j1), z (i1, j0), w (i0, j0)). agl's NDSR
+# networks build their input tile from such squares: 27 of Ocarina of Time's 32 shaders with gather offsets, all compute, 3 to 15 squares each
+GATHER_QUAD = {(0, 0): 'w', (1, 0): 'z', (0, 1): 'x', (1, 1): 'y'}
+def gather_quad(off):
+    """off: the four offsets as written (int2(a), int2(a, b)) → (the square's corner b as MSL, the swizzle that puts its texels in the offsets' order), or None"""
+    xy = []
+    for o in off:
+        m = re.fullmatch(r'int2\(\s*(-?\d+)\s*(?:,\s*(-?\d+)\s*)?\)', o)
+        if not m: return None
+        xy.append((int(m.group(1)), int(m.group(2) if m.group(2) is not None else m.group(1))))
+    bx, by = min(x for x, _ in xy), min(y for _, y in xy)
+    rel = [(x - bx, y - by) for x, y in xy]
+    if sorted(rel) != sorted(GATHER_QUAD): return None
+    return f'int2({bx}, {by})', ''.join(GATHER_QUAD[r] for r in rel)
 GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
 def gather_offsets(msl):
     if not re.search(r'\bspvGather(Compare)?ConstOffsets\(spvDesc|= spvGather(Compare)?ConstOffsets\(', msl): return msl
@@ -331,10 +346,13 @@ def gather_offsets(msl):
         tex, smp, off, rest = args[0], args[1], arrays[args[2]], ', '.join(args[base:])
         tail = '' if cmp else ', ' + args[3]
         fn = 'gather_compare' if cmp else 'gather'
-        out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
+        quad = gather_quad(off)
+        if quad: out += [msl[i:m.start()], f'({tex}.{fn}({smp}, {rest}, {quad[0]}{tail}).{quad[1]})']
+        else: out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
         i = j
     out.append(msl[i:])
     msl = ''.join(out)
+    if 'dm_gather4(' not in msl: return msl
     k = msl.index('\n', msl.index('using namespace metal;')) + 1
     return msl[:k] + GATHER4 + msl[k:]
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
@@ -1035,11 +1053,14 @@ def c2_array(name, ty):
 
 POOL_MIN = 33   # arrays at least this long are pools: Program.cs sizes Ryujinx's handle fallback by the pools, the vendored BindlessElimination keeps 32-entry slot arrays (NvnSlotArrayLength)
 
+# The test is a plain load: an atomic one, even relaxed, goes to the shared cache every time, and the reads of a pass name a few IDs, so its pixels queue on the same word.
+# A 1536x864 pass of 16 marks a pixel over 16 IDs: 2.60 ms atomic, 0.34 plain, 0.18 with no mark (Apple M6). A stale 0 costs an OR that changes nothing; a bit only goes
+# from 0 to 1 while a submission runs, as the host clears one (pool_seen_clear) only for an ID registered anew, which work committed after it reads
 POOL_MARK = """template<typename P> static inline __attribute__((always_inline)) uint dm_pool_mark(constant P* p, uint i)
 {
-    device atomic_uint* w = reinterpret_cast<device atomic_uint*>(p->seen) + (i >> 5);
+    device uint* w = reinterpret_cast<device uint*>(p->seen) + (i >> 5);
     uint b = 1u << (i & 31u);
-    if (!(atomic_load_explicit(w, memory_order_relaxed) & b)) atomic_fetch_or_explicit(w, b, memory_order_relaxed);
+    if (!(*w & b)) atomic_fetch_or_explicit(reinterpret_cast<device atomic_uint*>(w), b, memory_order_relaxed);
     return i;
 }
 
@@ -1049,7 +1070,7 @@ def pool_arrays(src):
     """Ryujinx's arrays for a texture handle it cannot trace to one slot (<stage>_<t|s>_cb0_40000000, indexed by the handle's texture / sampler ID), sized to the whole ID ranges
     (Program.cs QueryTextureArrayLengthFromPool, 2^20 and 2^12) → a pointer to a pool the replay keeps per element type (nvn_mtl.m pool_gpu): struct spvPool_<name> { uint n; ulong seen;
     array<element, 1> e; }, read as (&e[0])[min(index, n)], n being the highest ID the host filled. A read of a texture pool also sets the ID's bit in the bitmap at seen (dm_pool_mark), as which IDs a
-    shader reads is known only here: the host makes those textures instead of all of them. The word is read first: a bit is set once, so nearly every read costs a load, not an atomic. The struct declares one element: Metal's argument encoder walks every element
+    shader reads is known only here: the host makes those textures instead of all of them. The word is read first, with a plain load: a bit is set once, so nearly every read costs a load, not an atomic. The struct declares one element: Metal's argument encoder walks every element
     of a declared array (AGX IndirectArgumentLayoutGen2::parseArray), and for 2^20 textures that took 57 ms and 66 MB per encoder (9.7 GB in Mario Party Superstars' prewarm);
     the elements are 8-byte resource IDs, so the pointer reaches the rest (checked on the GPU). Mario Party Superstars' characters read their light textures' handles from a
     storage buffer (6,370 pixel shaders). The argument IDs are then renumbered in member order, a pointer taking one and any other array its length, as the host lays the buffer out.
