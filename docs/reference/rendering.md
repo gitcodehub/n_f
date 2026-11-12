@@ -226,6 +226,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `nvn_tex.c` `level_walk`: a level at least one tile wide, high and deep is laid out with its width padded to whole tiles, the levels from the first smaller one on form the mip tail (packed as usual), and the storage is whole tiles, 64 KB aligned.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md): laid out unpadded, the 1024×1024 ASTC 6×6 clothes of Hinoa and Minoto (43 GOBs wide instead of 48, level 1 at 0x81000 instead of 0x90000) read 2,183 all-zero blocks in level 0 and 3,043 in level 1, which ASTC decodes as its error colour: their trousers, sleeves and gloves were magenta, worst in Kamura Village.
 
+### Packaged textures carry width alignment as well as height and depth
+
+- **Symptom:** a fixed magenta rectangle over part of a packaged ASTC texture (Bayonetta Origins' tutorial-card background), the same in every frame.
+- **Cause:** `SetPackagedTextureLayout` was kept only as byte 0 (block height and depth) in the texture description. Byte 1's low nibble is log2 of a width alignment in GOBs: the levels at least one tile (that many GOBs wide, one block high and deep) in size are padded to whole tiles, as a sparse texture's are to its 64 KB tiles, the levels from the first smaller one on form the mip tail, and a layered texture's layers align to the whole block times that width. It applies whether or not the texture is `SPARSE`. Without it a texture whose width is not a whole number of tiles was laid out too narrow: its rows from the second block row on, its later levels and layers read from the wrong place, and the padding they read, all-zero ASTC blocks, decodes as magenta.
+- **Fix:** `nvn_tex.c` (`packaged_width_log2`, `level_walk`, `layer_bytes`): `nvn_texdesc.pkg_layout` holds byte 0 and the width nibble, and the width alignment pads the tiled levels and aligns the layers. A layout with a width nibble of 0 is laid out as before; flags and the sparse tile layout the game reads are unchanged. The `[nvn] packaged texture` log line prints the width alignment.
+- **Found on:** Bayonetta Origins: Cereza and the Lost Demon (`0100CF5010FEC000`, 1.0.0, no profile in the repository): the 2052x1026 ASTC 6x6 tutorial-card background (byte 0 3, width 4) is 96 GOBs wide and 0x120000 bytes; laid out 86 GOBs wide (0x102000) its rows from y 384 on read ten GOB columns of padding, the 240-pixel-wide magenta rectangle. Checked on an iPhone (PR #2268). The packaged layouts logged in nine other games' runs all have a width nibble of 0.
+- **Check:** `t_tex_layout` (width 0 and 4, a mip tail, an array and a cube; the width-4 shapes fail without the fix) and `t_nvn` (the builder keeps the nibble, the flags and sparse tile layout are unchanged). The author compared the layout with the SDK's own arithmetic on 37,296 shapes and replayed the game's texture on the GPU; neither is in the repository (they need the game's files).
+
 ### Sparse textures take the block height of their 64 KB tile
 
 - **Symptom:** a CPU-filled texture shuffled into a patchwork of rectangles (OCTOPATH TRAVELER's world map on the traveler selection).
@@ -852,6 +860,13 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Cause:** Unreal's stencil shader resources are second textures on the depth buffer's storage built with `nvnTextureBuilderSetDepthStencilMode(STENCIL)`, which the host only logged, so the character occlusion mask read depth where it tests stencil bits.
 - **Fix:** the builder's mode now goes to the texture (`tex_t.stencil`), whose sampling view is the `X32_Stencil8` one a stencil-mode texture view already got.
 - **Found on:** [DRAGON QUEST VII Reimagined](../../dm/games/0100A9D01C446000/README.md) (the character occlusion mask, `edbfc7a088be545e`).
+
+### The provoking vertex is the first
+
+- **Symptom:** `[RED] NVN unimplemented function called: nvnCommandBufferSetProvokingVertexMode`, once.
+- **Cause:** the call was not implemented. NVN2's driver writes its mode into the 3D class's `SET_PROVOKING_VERTEX` (method 0x1684), 0 for the first vertex of a primitive and 1 for the last.
+- **Fix:** mode 0 needs nothing: Metal's flat values come from the first vertex. Mode 1 has no Metal setting and is reported once (`[RED] nvnCommandBufferSetProvokingVertexMode 1 (the last vertex)`); open until a game sets it.
+- **Found on:** [PRAGMATA](../../dm/games/0400C76024710000/README.md), which sets mode 0.
 
 ### Conservative rasterization remains unimplemented
 
@@ -1488,6 +1503,13 @@ The Vulkan layer (`dm/gfx/vk/hle_vk.m`) was written for Hades; Super Mario Galax
 - **Fix:** a descriptor now holds the texture, sampler state and buffer it was written with (retained), as a hardware descriptor holds a copy of the handle.
 - **Found on:** [Super Mario Galaxy 2](../../dm/games/0100FD8022DAA000/README.md) (issue 68). Through the opening and the first storybook stage the game allocates 22,785 descriptor sets and frees none, and destroys only 5 image views (and 1,244 images), so a stale element is rare: a Mac run that kept destroyed objects to catch their binds found none there.
 
+### Descriptor copies into a binding with immutable samplers
+
+- **Symptom:** a texture copied into a combined-image-sampler binding with immutable samplers is sampled with the source's sampler (its filtering, addressing, LOD clamps), not the one the layout fixed.
+- **Cause:** `vkUpdateDescriptorSets` copied each descriptor whole (`*t = *s`), so a copy replaced the sampler state the set's allocation had put in place from the layout. Vulkan's updates, copies as well as writes, change only the image of a combined image sampler whose binding has immutable samplers, and a sampler-only copy into such a binding is not allowed. The write path (`desc_write`) already kept the sampler.
+- **Fix:** copies go through `desc_copy` in `dm/gfx/vk/hle_vk.m`: the source descriptor whole, but the destination's sampler stays when its binding has immutable samplers (`lbind.imm`). A source's immutable sampler is part of its descriptor and is copied into a binding without them. `dm/gfx/tests/t_vk_desc.m` checks both directions.
+- **Found on:** no game: a report reproduced it in `t_vk_desc.m` (source sampler A, destination immutable sampler B; after the copy the destination held A).
+
 ### An unwritten secondary blend source
 
 - **Symptom:** Metal refuses a pipeline with "Fragment shader does not write to render target color(0), index(1) that is required for blending"; the Metal 4 specialization path can instead abort after `MTLCompilerService` crashes in `AGCLLVMStatelessFragmentObject::buildBlendFactor`.
@@ -1704,6 +1726,13 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - Uniforms are CPU copies per stage, set as bytes at a draw after they change; pipelines are cached per program by vertex layout, attachment formats, blend and colour mask; disabled vertex arrays read the attribute's current value (GL's default (0, 0, 0, 1) until `glVertexAttrib4f`) through a constant-step buffer. Without `glBindAttribLocation` the game's attribute index is the Metal one: `glGetAttribLocation` returns the shader's own attribute numbers. With it, the layer maps each Metal input to the game's index at the link.
 - A GLSL `bool` is a `uint` in the SPIR-V block; `gl_shaders.py` keeps the declared type, as LÖVE's `Shader:send` takes only a boolean for a bool.
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md) (no `glBindAttribLocation`); [Balatro](../../dm/games/0100CD801CE5E000/README.md): LÖVE binds VertexPosition, VertexTexCoord, VertexColor and ConstantColor to 0–3 with `glBindAttribLocation` before each link, keeps VertexColor and ConstantColor as disabled arrays and sets their values with `glVertexAttrib4f` (the draw colour); it lists uniforms with `glGetActiveUniform` (types as GL enums, arrays as `name[0]`) and reads their initial values back with `glGetUniformfv` / `iv`.
+
+### GL shaders and programs deleted while in use
+
+- **Symptom:** a program whose shaders were deleted after `glAttachShader` and before `glLinkProgram` logs `program N: a shader is missing from the library, its draws are skipped`, or links a shader of the wrong stage; draws after `glDeleteProgram` of the current program log `draw with no usable program (0)`.
+- **Cause:** `glDeleteShader` freed the shader at once and its name went to the next `glCreateShader`, while a program keeps its shaders by name: a link then found no shader, or another one (a fragment shader as the vertex stage). In GL a shader deleted while attached is only flagged (`GL_DELETE_STATUS` 1), keeps its name, and goes when its last program detaches it or is deleted. Likewise `glDeleteProgram` freed the current program and made none current, where GL keeps it in use until another `glUseProgram`. `glDetachShader` was not implemented.
+- **Fix:** `dm/gfx/gl/hle_gl.m` counts each shader's attachments (`shader_t.refs`; one shader per stage, a new one replaces and releases the old); `glDeleteShader` of an attached shader sets `deleted`, and `shader_release` frees it with its last attachment (`glDetachShader`, a replacing attach, the program's own end). `glDeleteProgram` of the current program sets `prog_t.deleted` and `glUseProgram` of another frees it (`prog_free`, which releases its shaders); any other program goes at once. Both `GL_DELETE_STATUS` queries report the flag. A linked program already held what its link took (functions, shader tables, uniforms), so later attach, detach and delete calls leave it drawing as linked. `make -C dm/gfx/tests GAME=<id> gl-imports` checks the lifetimes through the real entry points.
+- **Found on:** no game: the report reproduced it in `t_gl_imports.m` (an attached vertex shader deleted, then a new fragment shader took its name and the program's vertex stage resolved to it). [Balatro](../../dm/games/0100CD801CE5E000/README.md) takes the path without the symptom: when LÖVE makes its window again it deletes its first three default programs' shaders while they are attached, then the programs (`DM_GL_LOG=1`: `DeleteShader 1 (attached: flagged)` … `DeleteProgram 7`), so each shader now goes with its program; it never links after deleting a shader, and the title and the tutorial draw the same as before.
 
 ### GL textures, swizzles and uploads
 
