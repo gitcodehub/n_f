@@ -19,10 +19,6 @@
 #include "romfs_image.h"
 #include "save_sync.h"
 
-// Every take-over in this file runs on the big host stack (hle_bigstack.c): path buffers are sized by PATH_MAX and one file open takes 6-7 KB of stack, while a game's save thread can have as little as 8 KB (Super Mario 3D World + Bowser's Fury)
-#undef HLE_FORCE
-#define HLE_FORCE HLE_FORCE_BIG
-
 #define RES_PATH_NOT_FOUND 0x202u      // fs module 2, description 1
 #define RES_PATH_EXISTS    0x402u      // fs module 2, description 2
 #define RES_RENAME_OTHER_FS 0x2F2402u  // fs module 2, description 6034: ResultRenameToOtherFileSystem
@@ -133,7 +129,6 @@ static int dm_fs_test_fail(const char *pt) {
         q = end ? end + 1 : q + n; }
     return 0;
 }
-static int in_txn_dir(const char *hp) { return save_txn_from_path(hp); }
 static int rm_tree(const char *p);
 // Reads and checks a RomFS image's header and index; NULL (and a red line) when it is not a complete image
 static romfs_img *img_open(const char *path) {
@@ -1159,7 +1154,7 @@ static Result rename_entry(const char *from, const char *to) {
     if (rename(hp, hp2)) return err_res("rename", hp);
     if (dm_fs_test_fail("guestname") || set_guest_name(hp2, to)) { int e = errno ? errno : EIO;
         if (dm_fs_test_fail("renameback") || rename(hp2, hp)) {   // the rollback fails too: the file stays at the new path with wrong guest-name metadata; do not exit -- inside a transactional save, this transaction's commit is refused (committed version unchanged; recloning restores it)
-            int from_txn = in_txn_dir(hp), to_txn = in_txn_dir(hp2);
+            int from_txn = save_txn_from_path(hp), to_txn = save_txn_from_path(hp2);
             LOG("[RED] fs rename: writing the name metadata failed and so did the rollback errno=%d: %s stays at the new path%s", errno, hp2, from_txn >= 0 || to_txn >= 0 ? ", the affected save commit(s) will be refused" : "");
             if (from_txn >= 0) save_poison_txn(from_txn, e);
             if (to_txn >= 0 && to_txn != from_txn) save_poison_txn(to_txn, e);
