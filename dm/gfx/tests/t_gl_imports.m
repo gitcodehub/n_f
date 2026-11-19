@@ -284,6 +284,45 @@ static void test_compressed_arrays(void) {
     h_glDeleteTextures(1, &name);
 }
 
+static void test_packed_uploads(void) {
+    static const struct { GLenum internal, format, type; MTLPixelFormat metal; } cases[] = {
+        {GL_RGB10_A2, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, MTLPixelFormatRGB10A2Unorm},
+        {GL_R11F_G11F_B10F, GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV, MTLPixelFormatRG11B10Float},
+    };
+    // Two one-pixel rows, with an unused packed word between them. Alignment 1 exposes a three-byte source layout.
+    const uint8_t src[] = {0x12, 0x34, 0x56, 0x78, 0xee, 0xee, 0xee, 0xee, 0xaa, 0xbb, 0xcc, 0xdd};
+    const uint8_t want[][8] = {
+        {0x12, 0x34, 0x56, 0x78, 0xaa, 0xbb, 0xcc, 0xdd},
+        {0x78, 0x56, 0x34, 0x12, 0xdd, 0xcc, 0xbb, 0xaa},
+    };
+    h_glPixelStorei(GL_UNPACK_ROW_LENGTH, 2);
+    h_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    int failures = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+        GLuint name;
+        h_glGenTextures(1, &name); h_glBindTexture(GL_TEXTURE_2D, name);
+        for (int swap = 0; swap <= 1; swap++) {
+            h_glPixelStorei(0xcf0, swap);   // GL_UNPACK_SWAP_BYTES
+            h_glTexImage2D(GL_TEXTURE_2D, 0, cases[i].internal, 1, 2, 0, cases[i].format, cases[i].type, src);
+            assert(h_glGetError() == GL_NO_ERROR);
+            tex_t *t = tex_of(name);
+            assert(t && tex_make(t, 0) && t->tex.pixelFormat == cases[i].metal);
+            uint8_t got[sizeof want[0]];
+            [t->tex getBytes:got bytesPerRow:4 fromRegion:MTLRegionMake2D(0, 0, 1, 2) mipmapLevel:0];
+            if (memcmp(got, want[swap], sizeof got)) {
+                fprintf(stderr, "GL packed upload type %#x, GL_UNPACK_SWAP_BYTES=%d: wrong bytes\n", cases[i].type, swap);
+                failures++;
+            }
+        }
+        h_glDeleteTextures(1, &name);
+    }
+    h_glPixelStorei(0xcf0, 0);
+    h_glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    h_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    assert(!failures);
+    puts("GL packed uploads (RGB10_A2, R11F_G11F_B10F): OK");
+}
+
 // What DOOM 3's renderer (id Tech 4's BFG Edition) needs of the layer: its ARB names and extension check, named uniform blocks bound by range, two-sided stencil, frame copies into
 // a texture, streamed compressed images, byte-swapped 16-bit images, programs with a vertex shader alone, sync queries and wireframe
 static void test_doom3(void) {
@@ -554,6 +593,45 @@ static void test_program_validation(void) {
     h_glUseProgram(was); h_glDeleteProgram(pr); h_glDeleteShader(vs); h_glDeleteShader(fs); assert(h_glGetError() == GL_NO_ERROR);
 }
 
+static void test_active_attributes(void) {
+    void (*active)(GLuint, GLuint, GLsizei, GLsizei *, GLint *, GLenum *, GLchar *) = import("glGetActiveAttrib");
+    assert(active && h_eglGetProcAddress("glGetActiveAttrib") == (void *)active);
+    assert(h_eglGetProcAddress("glGetActiveAttribARB") == (void *)active);
+    static shattr attrs[] = {{.name = "position", .slot = 0, .type = T_VEC3}, {.name = "uv", .slot = 2, .type = T_VEC2}};
+    static shinfo vsi = {.ub_slot = -1, .na = 2, .a = attrs};
+    GLuint pr = h_glCreateProgram(), vs = h_glCreateShader(GL_VERTEX_SHADER);
+    GLint value;
+    h_glGetProgramiv(pr, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &value); assert(value == 0);
+    shader_of(vs)->si = &vsi; shader_of(vs)->fn = (id)[NSObject new];
+    h_glAttachShader(pr, vs); h_glBindAttribLocation(pr, 7, "position"); h_glLinkProgram(pr);
+    h_glGetProgramiv(pr, GL_ACTIVE_ATTRIBUTES, &value); assert(value == 2);
+    h_glGetProgramiv(pr, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &value); assert(value == sizeof "position");
+    assert(h_glGetAttribLocation(pr, "position") == 7);
+
+    GLsizei length; GLint count; GLenum type; char name[16];
+    active(pr, 0, sizeof name, &length, &count, &type, name);
+    assert(length == 8 && count == 1 && type == GL_FLOAT_VEC3 && !strcmp(name, "position"));
+    active(pr, 1, 2, &length, &count, &type, name);
+    assert(length == 1 && count == 1 && type == GL_FLOAT_VEC2 && !strcmp(name, "u"));
+    active(pr, 0, 0, &length, NULL, NULL, name);
+    assert(length == 0 && !strcmp(name, "u") && h_glGetError() == GL_NO_ERROR);
+
+    length = 23; count = 42; type = GL_INT;
+    active(pr, 2, sizeof name, &length, &count, &type, name);
+    assert(h_glGetError() == GL_INVALID_VALUE);
+    active(pr, 0, -1, &length, &count, &type, name);
+    assert(h_glGetError() == GL_INVALID_VALUE);
+    active(vs, 0, sizeof name, &length, &count, &type, name);
+    assert(h_glGetError() == GL_INVALID_OPERATION);
+    assert(length == 23 && count == 42 && type == GL_INT && !strcmp(name, "u"));
+
+    h_glDetachShader(pr, vs); h_glLinkProgram(pr);
+    h_glGetProgramiv(pr, GL_ACTIVE_ATTRIBUTES, &value); assert(value == 0);
+    h_glGetProgramiv(pr, GL_ACTIVE_ATTRIBUTE_MAX_LENGTH, &value); assert(value == 0);
+    h_glDeleteProgram(pr); h_glDeleteShader(vs);
+    puts("GL attribute reflection: count, maximum length, enumeration, truncation and errors: OK");
+}
+
 static void test_fate_calls(void) {
     assert(import("glValidateProgram") == (void *)h_glValidateProgram && import("glLineWidth") == (void *)h_glLineWidth);
     assert(import("glClearTexImage") == (void *)h_glClearTexImage_bs);
@@ -691,7 +769,10 @@ static void test_rg_texture_uploads(void) {
     level = &tex_of(name)->pend[0][0];
     assert(level->pitch == 4 && !memcmp(level->data, rgba8, sizeof rgba8));
     h_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 1, 1, 0, GL_RG, GL_FLOAT, float_rg);
-    assert(level->pitch == 16 && !memcmp(level->data, rgba32f, sizeof rgba32f));
+    float uploaded[4];
+    assert(level->pitch == sizeof uploaded);
+    memcpy(uploaded, level->data, sizeof uploaded);
+    for (int i = 0; i < 4; i++) assert(uploaded[i] == rgba32f[i]);
     h_glDeleteTextures(1, &name);
     puts("GL texture uploads: RED/RG expansion, typed components, row length and byte swapping: OK");
 }
@@ -809,10 +890,12 @@ int main(int argc, char **argv) {
     test_uniform_buffer();
     test_compressed_arrays();
     test_doom3();
+    test_packed_uploads();
     if (!cpu) test_lod_bias();
     test_sampler_objects(!cpu);
     test_extension_names_and_egl();
     test_program_validation();
+    test_active_attributes();
     test_fate_calls();
     if (fixture) test_argument_buffers(fixture);
 
