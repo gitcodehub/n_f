@@ -422,6 +422,60 @@ def mshd_shaders(d, label):
     if len(out) % 2: red(f'{label} MSHD: {len(out)} stages, not in pairs')
     return out
 
+def noire_wad_shaders(d, label):
+    """RAGE's WAD v1 (L.A. Noire's out.wad.nx): u32 member count, then 12 bytes per member (u32 unknown, offset, size). After the last member is a length-prefixed name per entry
+    (u16 length, then that many bytes). Only the VFP members contain the split GLSLC arrays this reader uses."""
+    count, = field(d, '<I', 4, label)
+    if not count: red(f'{label}: empty WAD table')
+    directory = span(d, 8, 12 * count, f'{label} directory')
+    _, last_offset, last_size = struct.unpack_from('<III', directory, len(directory) - 12)
+    data_start = 8 + len(directory)
+    names = data_end = last_offset + last_size
+    if not data_start <= last_offset <= data_end <= len(d): red(f'{label}: WAD last member or names outside archive data')
+    out = []
+    shader_end = data_start
+    for _, offset, size in struct.iter_unpack('<III', directory):
+        n, = field(d, '<H', names, f'{label} member name length')
+        name = span(d, names + 2, n, f'{label} member name')
+        names += 2 + n
+        if not name.endswith(b'.vfp.nx'): continue
+        try: member = name.decode('utf-8')
+        except UnicodeDecodeError: red(f'{label}: WAD shader member name is not UTF-8: {name!r}')
+        if any(c in member for c in '\t\r\n'): red(f'{label}: WAD shader member name would break the shader map: {name!r}')
+        where = f'{label}/{member}'
+        if offset < data_start or offset + size > data_end: red(f'{where}: WAD member outside data region')
+        if offset < shader_end: red(f'{where}: overlapping or unordered WAD shader members')
+        shader_end = offset + size
+        out.extend(noire_vfp_shaders(d[offset:shader_end], where))
+    if not out: red(f'{label}: no VFP shader records')
+    return out
+
+def noire_vfp_shaders(d, label):
+    """VFP stores GLSLC headers, control sections and code in three separate arrays at the end of the file."""
+    _, headers_len, controls_len, code_len = field(d, '<4Q', 0, label)
+    header_size = 0x120
+    headers = len(d) - headers_len - controls_len - code_len
+    if not headers_len or headers_len % header_size or headers < 32:
+        red(f'{label}: invalid VFP array lengths')
+    controls = headers + headers_len
+    code = controls + controls_len
+    out = []
+    ctl_end = code_end = 0
+    for h in range(headers, controls, header_size):
+        where = f'{label}#VFP@{h:#x}'
+        if d[h:h + 4] != b'\x91\x68\x86\x19': red(f'{where}: missing GLSLC header')
+        ctl_offset, code_offset, code_size, ctl_size = struct.unpack_from('<4I', d, h + 0xc0)
+        if ctl_offset != ctl_end or code_offset != code_end or ctl_offset + ctl_size > controls_len or not 0 < code_size <= code_len - code_offset:
+            red(f'{where}: invalid VFP record spans')
+        ctl_end, code_end = ctl_offset + ctl_size, code_offset + code_size
+        ctl, instructions = d[controls + ctl_offset:controls + ctl_end], d[code + code_offset:code + code_end]
+        stage = glslc_stage(ctl, instructions) if ctl_size >= 0x708 else None
+        why = check(where, stage, ctl, instructions) if stage else 'invalid VFP shader header'
+        if why: red(f'{where}: {why}')
+        out.append((where, stage, ctl, instructions))
+    if ctl_end != controls_len or code_end != code_len: red(f'{label}: unclaimed bytes in VFP arrays')
+    return out
+
 def glslc_stage(ctl, code):
     """A GLSLC output's stage, from its code area's header (graphics: the SPH's stage bits), or compute when the code has no header and the control's thread group (+0x748) is filled"""
     if nvn2_ctl(ctl): return nvn2_stage(ctl, code)
@@ -458,7 +512,9 @@ def glslc_program(d, h, size, label):
     if len(secs) < 2 or len(set(sts)) < len(sts) or any(not st or check(label, st, ctl, code) for st, (ctl, code) in zip(sts, secs)): return []
     return [(f'{label}#GLSLC@{h:#x}#var', st, ctl, code) for st, (ctl, code) in zip(sts, secs)]
 
-def glslc_shaders(d, label, need=True, skip=(), ranges=None):
+GLSLC_MAGIC = b'\x91\x68\x86\x19'
+
+def glslc_shaders(d, label, need=True, skip=(), ranges=None, offsets=None):
     """GLSLC compiler outputs (838 in 13 Sentinels' main read-only segment, one stage each): from the magic 0x19866891, +0x44 = the whole output's length; an output of one stage holds exactly one control section,
     read by its section header (glslc_section), else with the code area right after it (control +0x20 = control length); one of several stages is read by its section headers (glslc_program).
     The magic is only 4 bytes, so only outputs that pass the triple check are kept. Every game's main is searched: Unity's player has 11 of its own (Fire Emblem Engage, Ace Attorney Investigations
@@ -472,10 +528,11 @@ def glslc_shaders(d, label, need=True, skip=(), ranges=None):
         out.extend(programs)
         if programs and ranges is not None: ranges.append((h, h + size))
 
-    for m in re.finditer(b'\x91\x68\x86\x19', d):
-        if any(a <= m.start() < b for a, b in skip): continue
-        if m.start() + 0x48 > len(d): continue
-        h = m.start(); size, _, first, _ = glslc_layout(d, h)
+    if offsets is None: offsets = (m.start() for m in re.finditer(re.escape(GLSLC_MAGIC), d))
+    for h in offsets:
+        if any(a <= h < b for a, b in skip): continue
+        if h + 0x48 > len(d): continue
+        size, _, first, _ = glslc_layout(d, h)
         if first == 0xa8:   # NVN2: its section headers say everything; its control sections are too short for the rule below
             if not 0 < size <= len(d) - h: continue
             secs = glslc_section(d, h, size) or []
@@ -2975,7 +3032,7 @@ def ue_legacy_jobs(files, parts=64, mains=()):
     and the update's *_0_P.pak) and version 11 paks without shader code archives (OCTOPATH TRAVELER II: Majesty-Switch.pak, 3.3 GB). The engine mounts them all as one view, and a patch pak
     (name ending in _P.pak) wins over the others for the same path. Only the newest copy of each path is scanned. With IoStore on (Mario & Luigi: Brothership) the cooked packages are the export bundles
     of the containers beside such a pak, the pak holding only the global shader cache of the shaders: those chunks are scanned too, the newest copy of each chunk ID (uepak.mount_order).
-    A v9 pak can supply a global shader cache and shared shader archives together. Only the inline files go to this scan, and a v9 pak can also lead to inline IoStore bundles with an empty index.
+    A short v8 or v9 pak can supply a global shader cache and shared shader archives together. Only the inline files go to this scan, and either can lead to inline IoStore bundles with an empty index.
     A pak whose index is encrypted (Little Nightmares II: Helios-Switch.pak, version 8, every entry encrypted too) is opened with the AES key from mains, the ExeFS main of every version
     (uepak.Keys), and its jobs carry the key: (UE_LEGACY, names, key). An encrypted container (DRAGON BALL Sparking! ZERO: every pakchunk*-Switch.utoc, the index of the pak beside each
     encrypted too) is read with the key that opens that pak, else the first key found, and its jobs carry it: (UE_IO, chunks, key).
@@ -2984,19 +3041,21 @@ def ue_legacy_jobs(files, parts=64, mains=()):
     def key(p):
         try: return key_of(p)
         except (OSError, ValueError, struct.error): return None
-    def inline(p):
-        try: return uepak.inline_shaders(p, key(p)) is True
-        except (OSError, ValueError, struct.error): return False
-    paks = [(p, r) for p, r in files if p.endswith('.pak') and inline(p)]
+    paks = []
+    for p, r in files:
+        if not p.endswith('.pak'): continue
+        try: inline, archives = uepak.pak_shader_sources(p, key(p))
+        except (OSError, ValueError, struct.error): continue
+        if inline: paks.append((p, r, archives))
     if not paks: return [], set()
     view, keys = {}, {}
-    for p, r in sorted(paks, key=lambda x: (x[1].endswith('_P.pak'), x[1])):   # patch paks last, so they replace; one view per pak folder (one per version given)
+    for p, r, archives in sorted(paks, key=lambda x: (x[1].endswith('_P.pak'), x[1])):   # patch paks last, so they replace; one view per pak folder (one per version given)
         try:   # all of a pak's names or none: a patch pak read halfway would still replace the base pak's files
             keys[p] = key_of(p); pk = uepak.Pak(p, keys[p])
             view.update({(os.path.dirname(p), os.path.normpath(pk.mount + name)): (p, r, name, pk.entry(name)['raw']) for name in pk.files
-                         if pk.version != 9 or not name.endswith('.ushaderbytecode')})   # a mixed v9 pak's archives go through uepak.job
+                         if not (archives and name.endswith('.ushaderbytecode'))})   # shared archives routed through uepak.job
         except (OSError, ValueError) as e: print(f'[RED] /{r}: the pak cannot be read ({e}); its shaders are left out', flush=True)
-    chunks, taken, folders = {}, {p for p, _ in paks}, {os.path.dirname(p) for p, _ in paks}
+    chunks, taken, folders = {}, {p for p, _, _ in paks}, {os.path.dirname(p) for p, _, _ in paks}
     for p, r in sorted(((p, r) for p, r in files if p.endswith('.utoc') and os.path.dirname(p) in folders), key=lambda x: uepak.mount_order(x[0])):
         try: t = uepak.Toc(p)
         except (OSError, ValueError, struct.error) as e: print(f'[RED] /{r}: the container cannot be read ({e}); its shaders are left out', flush=True); continue
@@ -3950,6 +4009,11 @@ def scan_file_in(args):
     if len(args) > 2:   # a range of LINKDATA entries (linkdata_jobs)
         linkdata_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == b'WAD\x01' and os.path.basename(path) == 'out.wad.nx':   # RAGE WAD variant with split GLSLC arrays (noire_wad_shaders)
+        from romfs import mmap
+        with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+            found = noire_wad_shaders(d, '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): GLSLC outputs in its zlib resources (bnd2_shaders)
         found += bnd2_shaders(open(path, 'rb').read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -4003,6 +4067,9 @@ def scan_file_in(args):
         if tail == RDHS:
             found += rdhs_shaders(path, '/' + rel)
             return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == b'NXCX' and head[12:16] == bytes(4) and head[8:12] != GFX_MAGIC and head[4:8] not in (ZSTD_MAGIC, LZ4_FRAME_MAGIC):
+        with open(path, 'rb') as f: archive = nxcx_shaders(f, '/' + rel)
+        if archive is not None: return rel, uniq_keys(archive), var_pairs(archive), trees
     if head[:4] == ZSTD_MAGIC: d = unzs(path)   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
     else:
         with open(path, 'rb') as f: d = f.read()
@@ -4038,6 +4105,28 @@ def scan_file_in(args):
         # main's 49). Metroid Dread's MSHD files hold GLSLC outputs too, which mshd_shaders already reads; no other profile's loose files hold any
         if not found and d[:4] != b'MSHD' and b'\x91\x68\x86\x19' in d: found += glslc_shaders(d, '/' + rel, need=False)
     return rel, uniq_keys(found), var_pairs(found), trees
+
+def nxcx_shaders(f, label):
+    """Scan the stored bytes of an NXCX texture archive (TSUKIHIME's w_allpac.mrg is 15.6 GiB).
+    Its header selects the loose-file path. An internal BAHS magic only activated that path's search
+    for other embedded formats. If any of those formats may be present, use the normal scanner.
+    Seek to GLSLC candidates through a mapping so random magic in compressed textures needs no full-file copy.
+    """
+    from romfs import mmap
+    other = (b'BNSH\0\0\0\0', b'SLCT\x03\x10\0\0', MGFX + b'\x05', MGFX + b'\x08', NEEDLE, SUMO_NX, NVNSH)
+    overlap = max(map(len, other)) - 1
+    offsets, tail, at = [], b'', 0
+    loose = False
+    while block := f.read(16 << 20):
+        chunk = tail + block
+        if any(magic in chunk for magic in other): return None
+        loose = loose or b'BAHS' in chunk or MGFX in chunk
+        offsets.extend(at - len(tail) + m.start() for m in re.finditer(re.escape(GLSLC_MAGIC), chunk) if m.end() > len(tail))
+        tail = chunk[-overlap:]
+        at += len(block)
+    if not loose and not offsets: return []
+    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+        return sead_prim_shaders(d, label) or glslc_shaders(d, label, need=False, offsets=offsets)
 
 def uniq_keys(found):
     uniq = {}

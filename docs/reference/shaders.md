@@ -4,6 +4,21 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 
 ## Containers by engine
 
+### RenderDragon material shaders
+
+- **Symptom:** the packer finds no loose SPIR-V files, although the game creates its modules from assets it ships.
+- **Cause:** RenderDragon places bgfx vertex and fragment v5 and compute v3 shader records in `renderer/materials/*.material.bin`. Its built-in graphics shader records are in the main NSO. Each record has a uniform table and a length-prefixed SPIR-V payload.
+- **Fix:** `vk_shaders.py` checks the material and bgfx headers, bounds-checks the uniform records and shader length, and requires the SPIR-V instruction stream to occupy that length exactly. It deduplicates by the same hash of the payload that the runtime uses. Compute rows include their workgroup size. Fragment shaders with three or more color outputs keep their normal MRT layout, which Metal cannot compile as dual-source blending.
+- **Found on:** [Minecraft for Nintendo Switch](../../dm/games/0100D71004694000/README.md) 1.26.62, with 1,784 unique graphics and 44 compute modules, including 11 built-in modules in `main`.
+
+### L.A. Noire WAD and VFP shader arrays
+
+- **Symptom:** the split finds only a few dozen shaders. The notebook pages render black, and game scenes have missing materials.
+- **Cause:** `out.wad.nx` has a span table and a name table. Its `.vfp.nx` members store the GLSLC headers, control sections and code in separate arrays.
+- **Fix:** the splitter maps `out.wad.nx` with the `WAD\x01` signature and reads its `.vfp.nx` members. It checks the name table and shader member ranges, requires non-empty code and complete coverage of the VFP arrays, then passes the original control and code bytes to the existing shader checks. The VFP arrays give individual stages. Their vertex and pixel pairing is unknown.
+- **Check:** `dm/gfx/tests/test_noire_shader.py` checks keys and bytes in both RomFS forms, the signature and basename gate, and rejection of truncated directories, invalid names and malformed spans. On M4 Pro/macOS 27.2.1, the WAD yielded zero shaders with `a6aaf66d` and 8,933 with the reader. A full split with the reader and the startup captures found 8,968 shaders, all of which compiled for the Mac.
+- **Found on:** [L.A. Noire 1.2](../../dm/games/0100830004FB6000/README.md#mac-validation) ([NX2Apple issue #1386](https://github.com/LNPANDY/NX2Apple/issues/1386)).
+
 ### Firaxis CIVBSF shader libraries
 
 - **Symptom:** the shader split stops with no shaders in `main` or RomFS, and the host reports missing programs while presenting a black picture.
@@ -105,6 +120,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** a worker's exception (and `red()`, a `SystemExit`) ended the whole split through the process pool, so one archive of a format revision a reader does not know stopped every other file's shaders too. `nlg_dict` read its index without checking the layout, so an index of another revision gave an `IndexError` instead of a line naming the archive.
 - **Fix:** `scan_file` leaves out a file whose reader fails, with `[RED] <file>: <why> (its shaders are left out)`, and the split goes on; at the end it prints `[RED] <n> file(s) could not be read, their shaders are left out (first: …)` and writes its tables. The NSP script shows that line and packs a provisional profile's IPA without those shaders; for a registered profile it stops there, since the profile's tables were split from every file. `nlg_dict` checks that the records and chunks fit the index and every chunk index is in range before reading it. The format itself still needs a reader: the line names the archive and, for NLG, its header bytes.
 - **Found on:** Mario Strikers: Battle League (no profile; [seedds/nxnative#282](https://github.com/seedds/nxnative/pull/282)): one of its 879 Next Level Games archives, a revision `nlg_dict` does not read. That revision is read now: [Next Level Games archives of revision 4](#next-level-games-archives-of-revision-4).
+
+### A large NXCX texture archive stalls the shader split
+
+- **Symptom:** the split stays at 99% for many minutes and the remaining worker consumes nearly all memory on a 16 GB Mac.
+- **Cause:** the generic loose-file scanner reads the entire 15.6 GiB `w_allpac.mrg` into a Python bytes object and searches it repeatedly for embedded formats. Byte sequences that happen to match shader magics occur inside compressed textures and trigger extra searches.
+- **Fix:** for an `NXCX` texture archive, look for embedded signatures in overlapping 16 MiB chunks. Pass GLSLC candidate offsets to the existing validator through a read-only mapping. If a signature indicates another supported embedded format, use the ordinary loose-file scanner.
+- **Found on:** [TSUKIHIME A piece of blue glass moon](../../dm/games/010057A01E4D4000/README.md) 1.0.2. The full split finished in 77–80 seconds on a 16 GB Apple M6 Mac mini with the files on S790. The original run was stopped after 19 minutes 55 seconds and its worker peaked at a 15.6 GiB physical footprint. The original reader, run against the large archive using a mapping for comparison, also found zero shaders there.
+- **Check:** `dm/tools/tests/test_split_nxcx.py` compares both paths for a valid GLSLC record whose magic crosses the chunk boundary, and checks that a BNSH signature takes the ordinary path.
 
 ### Next Level Games archives of revision 4
 
@@ -621,6 +644,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** the paks are version 8, which `uepak.py` did not read (only 4 and 11): `footer` raised, and `unreal_paks` skipped both paks as no Unreal paks. Version 8 keeps version 4's per-file index, but its footer is version 11's (key GUID, encrypted flag, magic 0xcc from the end, five 32-byte compression method names after the SHA-1), and an FPakEntry's compression method is an index (from 1) into those names instead of version 4's flags.
 - **Fix:** `uepak.py` reads version 8 as a legacy pak: its footer as version 11's, its index as version 4's, each file's method named from the footer (`Zlib`, decoded in Python by `Pak.read`). The shaders are inline in the cooked packages and `Engine/GlobalShaderCache-GLSL_SWITCH.bin`, as in [Unreal Engine 4.18](#unreal-engine-418-shaders-inline-in-cooked-packages), so `shader_split.py` `ue_legacy_jobs` reads them unchanged. `dm/tools/tests/test_uepak_v8.py` builds a version 8 pak with a Zlib file and a stored one.
 - **Found on:** DRAGON BALL Z: KAKAROT + A NEW POWER AWAKENS SET (`010051C0134F8000`, 1.00, SDK 9.3.1): 43,113 shaders from 3,776 files in 38 s; it plays from the title through the opening fight.
+
+### Unreal Engine short version 8 paks and version 1 shader archives
+
+- **Symptom:** the shader split finds no Unreal shaders on a game whose paks hold shared shader archives. The footer reader skips these version 8 paks with `no pak footer`.
+- **Cause:** the short version 8 footer has four compression method slots, putting its magic `0xac` bytes from the end. Each entry uses one byte for the method and has a 50-byte stored header. The version 1 shader archive stores a flat table of SHA-1 hashes, offsets, sizes and frequencies followed by stored or Zlib-compressed LSLG records.
+- **Fix:** `uepak.py` selects the entry layout from the footer and routes shared archives to the decode step. A pak can also supply inline shaders, so `shader_split.py` scans its inline files and takes the shared shaders from the decode step. The version 1 reader bounds each record and normalizes it to a decoded version 2 archive with no shader maps.
+- **Found on:** Minecraft Dungeons (`01006C100EC08000`). All 5 base pak indexes and all 46 update pak indexes parse to their declared end. The base game's two archives contain 8,398 records and the full split writes 7,853 unique shaders. For v1769472 the two archives contain 15,596 records and the full split with local DLC writes 14,903 unique shaders. Bloodstained: Ritual of the Night (`0100BF500207C000`, 1.60, v851968 with five DLC) has seven short v8 pak indexes that parse to their declared end. Its two archives contain 33,767 records, and the full split writes 33,401 unique shaders with zero unreadable files. [Minecraft Dungeons PR #1270](https://github.com/seedds/nxnative/pull/1270) · [Bloodstained PR #2652](https://github.com/seedds/nxnative/pull/2652)
 
 ### Unreal Engine frozen pak indices (version 9)
 
