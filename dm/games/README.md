@@ -40,7 +40,7 @@ Defaults may use `<ios>|<mac>` to select the platform's value before resolving a
 
 ## Games
 
-One row per profile; the notes are each profile's `README.md`.
+One row per profile; the notes are each profile's `README.md`. Entries marked provisional have a successful Mac playtest, with the remaining validation stated in their notes.
 
 | Game | Title ID | Build | SDK | Engine | Graphics |
 |---|---|---|---|---|---|
@@ -102,6 +102,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [DRAGON QUEST VII Reimagined](0100A9D01C446000/README.md) | `0100A9D01C446000` | 1.2.0 | 19.3.1 | Unreal Engine 4.27 | NVN |
 | [DRAGON QUEST XI S: Echoes of an Elusive Age – Definitive Edition](01006C300E9F0000/README.md) | `01006C300E9F0000` | 1.0.4 | 7.3.2 | Unreal Engine 4.18 | NVN |
 | [EA SPORTS FC 27](0100C49025D3E000/README.md) | `0100C49025D3E000` | 1.8d.310c | 22.2.0 | Frostbite 2025.1.2 (its NVN renderer in an NRO) | NVN |
+| [Farming Simulator 26: Nintendo Switch Edition](0100D440269E8000/README.md) | `0100D440269E8000` | 1.0.1.0 | 20.5.4 | GIANTS Engine | NVN |
 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](0100CE4010AAC000/README.md) | `0100CE4010AAC000` | 1.0.3 | 8.2.1 | Unity 2018.4.2f1 IL2CPP, FMOD | NVN |
 | [FINAL FANTASY RESONANCE](0100606026F12000/README.md) | `0100606026F12000` | 1.0.1 | 20.5.17 | Unreal Engine 5.6.1 | NVN |
 | [FINAL FANTASY RESONANCE, Asian release](0100B8A026F14000/README.md) | `0100B8A026F14000` | 1.0.1 | 20.5.17 | Unreal Engine 5.6.1 | NVN |
@@ -111,6 +112,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [FINAL FANTASY X/X-2 HD Remaster](0100BC300CB48000/README.md) | `0100BC300CB48000` | 1.0.0 (base) | 5.4.0 | PhyreEngine (Virtuos) | NVN |
 | [FINAL FANTASY XII THE ZODIAC AGE](0100EB100AB42000/README.md) | `0100EB100AB42000` | 1.1.0 | 6.4.0 | PhyreEngine | NVN |
 | [Fast Fusion](040041E0212AE000/README.md) | `040041E0212AE000` | v262144 (Switch 2) | 20.5.13 (Ounce) | Shin'en's engine | NVN2 |
+| [FIFA 23 Legacy Edition](01001C8016B4E000/README.md) | `01001C8016B4E000` | 1.0.0, 1.0.3 | 13.3.5 | EA proprietary engine | NVN |
 | [Fire Emblem Engage](0100A6301214E000/README.md) | `0100A6301214E000` | 2.0.0 | 12.3.7 | Unity 2020.3.18f1 IL2CPP, Wwise | NVN |
 | [Fire Emblem Fortune's Weave](04007EF01F8AE000/README.md) | `04007EF01F8AE000` | v131072 (Switch 2) | 22.2.0 (Ounce) | Intelligent Systems' engine, NintendoWare | NVN2 |
 | [Fire Emblem: Three Houses](010055D009F78000/README.md) | `010055D009F78000` | 1.2.0 | 6.5.0 | Koei Tecmo's KTGL | NVN |
@@ -127,6 +129,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Kirby's Dream Buffet](0100A8E016236000/README.md) | `0100A8E016236000` | 1.0.0 | 13.3.0 | HAL Laboratory's engine (Basil, NintendoWare) | NVN |
 | [Kirby Star Allies](01007E3006DDA000/README.md) | `01007E3006DDA000` | 4.0.0a | 4.4.1 | HAL Laboratory's engine (NintendoWare) | NVN |
 | [L.A. Noire](0100830004FB6000/README.md) | `0100830004FB6000` | 1.2 | 1.3.1 | Team Bondi's engine (Havok, FMOD) | NVN |
+| [LEGO Star Wars: The Skywalker Saga](010042D00D900000/README.md) | `010042D00D900000` | 1.10.0 | 12.3.6 | Traveller's Tales' engine | NVN |
 | [Luigi's Mansion 3](0100DCA0064A6000/README.md) | `0100DCA0064A6000` | 1.4.0 | 7.3.2 | Next Level Games' engine | NVN |
 | [Mario & Luigi: Brothership](01006D0017F7A000/README.md) | `01006D0017F7A000` | 1.0.0 | 12.3.2 | Unreal Engine 4.27.2, Wwise | NVN |
 | [Mario Golf: Super Rush](0100C9C00E25C000/README.md) | `0100C9C00E25C000` | 4.0.0 | 11.4.0 | Camelot's engine, NintendoWare | NVN |
@@ -189,6 +192,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [Rhythm Heaven Groove](0100D9F01D474000/README.md) | `0100D9F01D474000` | 1.0.0 (base) | 21.4.0 | Nintendo's own 2D engine | NVN |
 | [ROMANCE OF THE THREE KINGDOMS 8 REMAKE](0100C2A01A730000/README.md) | `0100C2A01A730000` | 1.1.3 | 17.5.3 | Koei Tecmo's KTGL | NVN |
 | [ROMANCE OF THE THREE KINGDOMS XIV: Diplomacy and Strategy Expansion Pack](0100ED7012DB2000/README.md) | `0100ED7012DB2000` | 1.0.10 | 10.4.1 | Koei Tecmo's KTGL | NVN |
+| [Sam & Max: The Devil's Playhouse](0100D5501857E000/README.md) | `0100D5501857E000` | 1.8.0 (provisional Mac profile) | 17.5.6 | Telltale Tool, FMOD | NVN |
 | [Sea of Stars](01008C0016544000/README.md) | `01008C0016544000` | 2.0.59001 | 16.2.0 | Unity 2021.3.25f1 IL2CPP | NVN |
 | [SHIN MEGAMI TENSEI V: Vengeance](010069C01AB82000/README.md) | `010069C01AB82000` | 1.0.3 | 15.3.2 | Unreal Engine 4.27 | NVN |
 | [Sid Meier's Civilization VI](010044500C182000/README.md) | `010044500C182000` | 1.2.19 | 8.2.1 | Firaxis, Havok, Wwise | NVN |
@@ -234,6 +238,7 @@ One row per profile; the notes are each profile's `README.md`.
 | [TRIANGLE STRATEGY](0100CC80140F8000/README.md) | `0100CC80140F8000` | 1.1.1 | 12.3.2 | Unreal Engine 4.27 | NVN |
 | [TSUKIHIME A piece of blue glass moon](010057A01E4D4000/README.md) | `010057A01E4D4000` | 1.0.2 | 17.5.4 | its own (not named) | NVN |
 | [TUNIC](0100DA801624E000/README.md) | `0100DA801624E000` | 1.0.3 | 14.3.0 | Unity 2020.3.36f1 IL2CPP, FMOD | NVN |
+| [Twelve Minutes](0100CD701434C000/README.md) | `0100CD701434C000` | 1.0.1 (base) | 12.3.7 | Unity 2019.4.31f1 IL2CPP, FMOD | NVN |
 | [Unicorn Overlord](010069401ADB8000/README.md) | `010069401ADB8000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
 | [Unicorn Overlord, Asian release](010054B01AD92000/README.md) | `010054B01AD92000` | 1.05 | 16.2.4 | Vanillaware's engine | NVN |
 | [UnMetal](01008F4014A74000/README.md) | `01008F4014A74000` | 1.2.0 | 14.3.0 | Unepic Fran's own engine (`arcadix`) | OpenGL |
