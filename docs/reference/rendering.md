@@ -1529,6 +1529,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `t_pso_archive` covers discarding a crashed period, draining its counts and capturing into a fresh one. `crashed_flush_race` holds a render or compute capture across hand-over, blocks its failing fallback until the writer runs, and checks that no archive is published. `compiler_death_notifications` injects interrupted specialization and MTLDevice compiles with no error output, holds a background prediction past the writer's bounded wait after its period was handed over, and checks that ordinary compile errors still publish valid captures. Run the focused cases with `t_pso_archive --compiler-death`. Ocarina of Time (cut10, M2): the archive without the bad period starts and plays (F1233); that period alone aborts at every start.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on an M2.
 
+### Missing required functions at the render pipeline API
+
+- **Symptom:** Metal can abort on a nil vertex, mesh or mesh fragment function when the host builds a pipeline through `MTLDevice`.
+- **Cause:** the device API validates its descriptor before returning a pipeline or an error. An unavailable shader function can leave a required descriptor member empty. Native mesh depth passes need the empty fragment function from `mtk_nop_fragment`.
+- **Fix:** `dev_rps` and `dev_mps` return a pipeline error before calling Metal when a required function is missing. Vertex depth-only passes can still omit their fragment function, and a mesh pipeline can still omit its object function.
+- **Check:** `t_pso_warm` with Metal API validation reproduces the nil vertex abort before the guard and verifies a returned error for missing vertex, mesh and mesh fragment functions after it. It also builds and draws valid native mesh pipelines and builds a depth-only mesh pipeline.
+- **Found on:** examined after the [Ocarina of Time compiler failures](../../dm/games/0400486024DEC000/README.md#mesh-compiler-workaround-validation). The fresh-start assertion logged in [#2825](https://github.com/seedds/nxnative/issues/2825#issuecomment-6983139176) occurs inside Metal's archive lookup after the host presents a complete Metal 4 descriptor. The device API checks cover a separate failure path.
+
 ### A pipeline compile crashes while an archive period is written
 
 - **Symptom:** the pipeline prebuild (`DM_PSO_PREBUILD=tool`, the NSP script's `[RED] dmhost exit code -11`), or a run that captures pipelines, dies with SIGSEGV and no `CRASH` line of its own. macOS's crash report has `objc_msgSend` ← `MultiLevelAirntBinaryCache::getElementAtDestination` ← `-[MTLCompiler compileFunctionRequestInternal:…]` ← `arch_capture`, and a thread on the `MTLBinaryArchive_Serialize` queue in `airntSerializeToURL` ← `arch_write_file`.
@@ -1793,6 +1801,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** dispatches now go into the open copy encoder, each after a barrier inside it (as texture copies are, `blit`), with the compute argument table set once per encoder (`dispatch_enc`): about 1.3 µs each.
 - **Found on:** [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md): after its first cutscene the first battle runs about 900–1,500 small dispatches a frame on the Mac (an iPhone log's call counts suggest more), each after a game barrier, at the same draws and passes; GPU 7.3 → 8.1 ms across the cutscene with the change.
 - **Note:** `DM_NVN_PASSGPU`, which times each dispatch, gives each its own encoder again (`DM_NVN_DISPATCH_OWN=1` did too until it was removed). A barrier before every dispatch is now only where NVN asks for one: [Compute dispatches that wait for each other](frame-rate.md#compute-dispatches-that-wait-for-each-other).
+
+### Compute histogram clear races its atomic fill
+
+- **Symptom:** sunlit surfaces stay clipped to white while shaded areas look right; gamma changes do not help. The exposure's average and adapted luminance targets contain NaN, which persists across frames.
+- **Cause:** The game records no NVN barrier between the 256-bin histogram clear and its atomic fill. Both use the same 1,024-byte storage buffer. Metal can run them concurrently, so a late clear can erase counts the fill has added. A short histogram can take the reducer's percentile search past bin 255. Static inspection of the SDK used by 4.04b (NintendoSDK 15.3.0, `d5a1029a57d8cd4fdf4eacad87b0cfd09`) found no unconditional wait between ordinary compute dispatches. The launch routine waits for idle when reusing its compute arena. The SDK 10.4 in the local 3.7 shows the same pattern.
+- **Fix checked on 3.7:** An opt-in NSO rewrite inserts the missing `nvnCommandBufferBarrier(0x21)` just before the game's histogram fill, using the same command-buffer lookup and barrier flags as the game's call before reduction. The host replays both. The patch is bound to the verified 3.7 main build. The corresponding site in 4.04 needs its own verification.
+- **Workaround for 4.04d:** `DM_NVN_DISPATCH_BARRIER=full` restored finite luminance (about 1.4–1.6) and exposure at 60 fps on the reporter's M2 Pro (macOS 27.2.1). Inferring dependencies from bound storage ranges can serialize independent work that shares a buffer, as seen in [Kirby Air Riders](frame-rate.md#compute-dispatches-that-wait-for-each-other).
+- **Found on:** [The Witcher 3](../../dm/games/0100A0800E9C4000/README.md), [issue #3048](https://github.com/seedds/nxnative/issues/3048). The registered 4.04b contains the same five exposure shaders as the reported 4.04d.
 
 ### Compute bindings prepare texture copies before the dispatch encoder
 
