@@ -1071,6 +1071,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `t_oe` calls both hooks without an SDK proxy and verifies that they produce no applet notifications or focus changes. The matching SDK instruction trace confirms the null interface and command 90; the rebuilt game passes startup on the Mac (identities and offsets are in its note).
 - **Found on:** [FIFA 23 Legacy Edition](../../dm/games/01001C8016B4E000/README.md), [PR #1696](https://github.com/seedds/nxnative/pull/1696). The IPC contract is documented in [Applet Manager services](https://switchbrew.org/wiki/Applet_Manager_services#EnableApplicationCrashReport).
 
+### `nn::oe::GetDisplayVersion` reads the exact NACP string
+
+- **Symptom:** saved games commit cleanly to disk, yet every slot in Entrance renders as an empty `START` tile; the game's version parser extracts `2` instead of `723` and fails its `>= 438` (`0x1b6`) savedata version filter.
+- **Cause:** Horizon's `nn::oe::GetDisplayVersion` returns the raw 16-byte `DisplayVersion` field from `control.nacp` (`+0x3060`), which in Fate/hollow ataraxia REMASTERED 1.0.2 is `"1.0.2 b723"`. Both the packing script (`re.search(r'display version (\S+)', ...)` and `nacp.version()`, which strips non-numeric suffixes for Apple's `CFBundleShortVersionString`) and `h_oe_DispVer` (which read only the profile's `DM_GAME_DISPLAY_VERSIONS` table instead of `control.nacp`) truncated `"1.0.2 b723"` to `"1.0.2"`. `smash::fw::frame::MainFrame::makeVersionString` turns runs of non-digits into `.` (`"1.0.2 b723"` → `"1.0.2.723"`), and `GameDataContext` / `FsnThumbnail::setHollowData` parse the integer after the last `.` (`723`, vs `2` when truncated).
+- **Fix:** `h_oe_DispVer` (`dm/host/hle_sdk16.c`) reads the 16-byte `DisplayVersion` directly from `control.nacp` (`+0x3060`) via `dm_control_read` (`dm/host/hle.h`, shared with `hle_fs.c`), falling back to `DM_GAME_DISPLAY_VERSIONS` / `"1.0.0"` only when no `control.nacp` is present (dumps / NUPs). `dm/tools/nacp.py` adds `display_version()` for the raw NACP string used in surveys and derived `build` rows (`scripts/build_ipa_from_nsp.py`), while `nacp.version()` / `bundle_version()` continues to format Apple's bundle version.
+- **Check:** `t_language` (`dm/host/tests/t_language.c`, under ASan+UBSan) checks `h_oe_DispVer` with `"1.0.2 b723"` beside `DM_ROMFS`, a 16-byte non-NUL field via `DM_CONTROL_NACP`, and missing-NACP fallbacks; `dm/tools/tests/test_nsp_alias.py` checks `derive_profile` vs `app_version_of` on `"1.0.2 b723"`. Probed live on Fate/hollow ataraxia REMASTERED 1.0.2 on Mac (`main+0x80ae2c` returns `"1.0.2 b723"`, `main+0xd2839c` stores `0x2d3` = 723 with zero patches).
+- **Found on:** [Fate/hollow ataraxia REMASTERED](../../dm/games/010070E022546000/README.md), [issue #2930](https://github.com/seedds/nxnative/issues/2930).
+
 ### The graphics scale does not follow the operation mode
 
 - **Symptom:** a Switch 2 game renders smaller docked than handheld, or smaller than console footage: Star Fox's scene was 768x432 docked (DLSS network resized to it at boot, its window 1920x1080) and 960x540 handheld; Ocarina of Time drew 2048x1152 docked, its 3D at no more than 1536x864; Donkey Kong Bananza's docked frame buffer was 2304x1296 on a 2880x1620 swap chain.
@@ -1613,6 +1621,13 @@ Most service calls can be found before they crash, before the first boot or the 
 ### `ro::ProtectRelro` runs natively
 
 - `nn::ro::ProtectRelro` (called from `main`'s DSO init), a new import of SDK 20, needs nothing: it runs natively on the host's no-op `SetMemoryPermission` / `SetMemoryAttribute`. Found on [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (1.9.0, SDK 20.5.22).
+
+### The SDK rejects a module that `svcQueryMemory` finds
+
+- **Symptom:** `Failed to get our const data section!` before `nnMain`. The SDK's `GetRequiredBufferSizeForGetAllModuleInfo` finds the game's code mapping but returns zero.
+- **Cause:** `nn::ro::GetModuleAddressRange` and `LookupModuleSymbol` by base consult the guest rtld lists. The host runs its own loader, so the SDK's automatic-load list is empty. The native range lookup rejects the game's code address, and the native symbol lookup returns `0xa16` for its own `nndetailRoGetRoDataStart` export.
+- **Fix:** answer both `nn::ro` lookups from the host's loaded modules. The module size ends at the 4 KiB-aligned MOD0 bss end, as rtld computes it. The symbol lookup takes the exact module base and searches that module. The SDK keeps its own module list and calls the game's exports for the exact read-only data range. See also [whole-process memory walks](memory.md#svcquerymemory-walks-the-whole-guest-process).
+- **Found on:** [Hitman Absolution, PR #3023](https://github.com/seedds/nxnative/pull/3023) (v131072, SDK 22.2.0). The native walk lists all four modules and both boundary exports resolve before `nnMain` on the Mac.
 
 ### Loading NROs with `ro::LoadModule`
 
