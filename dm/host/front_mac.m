@@ -46,7 +46,9 @@ static int g_input_on = 1;   // main thread: the game window is key, so its keyb
 
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 static _Atomic int g_screen_fps;   // the window's screen's maximumFramesPerSecond, kept up to date when the window moves to another screen
+static _Atomic int g_screen_native_fps;   // the screen's own rate before front_screen_match temporarily switched it in fullscreen
 int front_screen_max_fps(void) { return g_screen_fps; }
+int front_screen_capable_fps(void) { int hz = g_screen_native_fps; return hz > 0 ? hz : g_screen_fps; }
 static _Atomic CGDirectDisplayID g_screen_id;   // the window's screen (screen_refresh); 0 until the window is up, then the main display stands in
 int front_display_pixels(int *w, int *h) {
     CGDirectDisplayID id = g_screen_id; CGDisplayModeRef m = CGDisplayCopyDisplayMode(id ? id : CGMainDisplayID()); if (!m) return 0;
@@ -72,6 +74,8 @@ static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabil
             double hz = CGDisplayModeGetRefreshRate(cur); if (hz > 0) g_screen_fps = (int)round(hz);
         }
         if (cur) CGDisplayModeRelease(cur);
+    } else {
+        g_screen_native_fps = g_screen_fps;
     }
 }
 static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
@@ -125,7 +129,7 @@ static void screen_match_restore(int on_it, int undone) {   // main thread: the 
     // fullscreen window left that screen (the screens took the switch back), not the player leaving fullscreen
     double hz = mode_hz(g_match_orig); CGError r = screen_set_mode(g_match_id, g_match_orig);
     LOG("front end: screen %s %.0f Hz", r == kCGErrorSuccess ? "back at" : "could not be switched back to", hz);
-    if (r == kCGErrorSuccess && on_it) { if (hz > 0) g_screen_fps = (int)round(hz); g_screen_variable_refresh = g_match_orig_vrr; }   // the screen observer may not show the mode yet
+    if (r == kCGErrorSuccess && on_it) { if (hz > 0) g_screen_fps = g_screen_native_fps = (int)round(hz); g_screen_variable_refresh = g_match_orig_vrr; }   // the screen observer may not show the mode yet
     CGDisplayModeRelease(g_match_orig); g_match_orig = NULL; g_match_pick = 0; g_match_pick_vrr = 0;
     if (undone) g_match_undone = CACurrentMediaTime();
 }
@@ -147,7 +151,7 @@ static void screen_match_once(void) {   // screen_match_apply's work, never ente
     // must not be misread from a leftover variable-refresh flag
     if (!g_match_orig) screen_refresh(scr);
     int32_t cur_id = CGDisplayModeGetIODisplayModeID(cur);
-    if (g_match_orig && cur_id == CGDisplayModeGetIODisplayModeID(g_match_orig)) {
+    if (g_match_orig && cur_id == CGDisplayModeGetIODisplayModeID(g_match_orig) && cur_id != g_match_pick) {
         double since = CACurrentMediaTime() - g_match_switched;
         if (since < MATCH_SETTLE_S) {   // this host's switch has not shown yet: look again once it should have, in case no notification comes
             CGDisplayModeRelease(cur);
@@ -160,7 +164,7 @@ static void screen_match_once(void) {   // screen_match_apply's work, never ente
         // the screen is at its own mode again with no switch back from this host (macOS or the screen took the switch back): its rate as that mode has it, and the switch is undone
         double own = mode_hz(cur);
         LOG("front end: screen at its own %.0f Hz again %.1f s after this host switched it", own, since);
-        if (own > 0) g_screen_fps = (int)round(own);
+        if (own > 0) g_screen_fps = g_screen_native_fps = (int)round(own);
         g_screen_variable_refresh = g_match_orig_vrr;
         CGDisplayModeRelease(g_match_orig); g_match_orig = NULL; g_match_pick = 0; g_match_pick_vrr = 0;
         g_match_undone = CACurrentMediaTime();
@@ -291,6 +295,15 @@ static const char *pad_name(GCController *c);
 static void pads_motion_changed(GCController *gone);
 // GameController's controllers that the host reads from their HID reports instead, so they stay unread here: identical pads (pad_hid_mac.h) and original Joy-Cons (pad_jc1_mac.h)
 static int pad_gc_unread(GCController *c) { return hidpad_gc_unread(c) || jc1_gc_unread(c); }
+// Passive Switch Pro HID stick fallback (motion_pro_mac.h): check both mapped and unmapped GameController sticks so a system-remapped axis still counts as live
+static GCController *g_pro_gc, *g_pro_gc_prev, *g_pro_gc_gone;
+static int pro_gc_stick_nonzero(GCController *c, int right) {
+    GCExtendedGamepad *g = c.extendedGamepad;
+    GCControllerDirectionPad *d = right ? g.rightThumbstick : g.leftThumbstick;
+    if (d.xAxis.value != 0.f || d.yAxis.value != 0.f) return 1;
+    id<GCDirectionPadElement> u = c.input.unmappedInput.dpads[right ? GCInputRightThumbstick : GCInputLeftThumbstick];
+    return u && (u.xAxis.value != 0.f || u.yAxis.value != 0.f);
+}
 static void pad_read(GCExtendedGamepad *g) {
     if (!g_input_on) return;
     hq_poll(); if (hq_blocks_input(g_hq.phase)) return;
@@ -312,7 +325,12 @@ static void pad_read(GCExtendedGamepad *g) {
     if (cp_poll()) return;   // the controller applet's prompt has the controllers (front_ctrl_support)
     if (m) merge_rumble_to(NULL);   // DM_PAD_MERGE: a button on this controller takes player 1's rumble back from a Switch 2 pad or Joy-Cons read from HID
     dm_haptics_apple_controller(p, g.controller);
-    pad_set(p, m, pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value));
+    int32_t st[4] = {pad_axis(g.leftThumbstick.xAxis.value), pad_axis(g.leftThumbstick.yAxis.value), pad_axis(g.rightThumbstick.xAxis.value), pad_axis(g.rightThumbstick.yAxis.value)};
+    if ([g.controller.productCategory isEqualToString:@"Switch Pro Controller"] && !pad_gc_unread(g.controller)) {
+        int nz[2] = {pro_gc_stick_nonzero(g.controller, 0), pro_gc_stick_nonzero(g.controller, 1)};
+        dm_pro_sticks(p, nz, st);
+    }
+    pad_set(p, m, st[0], st[1], st[2], st[3]);
 }
 // Home and Capture: without this macOS takes them as system gestures (Home opens the Games app). Capture has no function in the host, Home quits when it is held (hq_poll).
 // macOS 27 respects the claim when the Home button setting for apps lets the app decide (hq_log_setting names it in the log)
@@ -322,16 +340,33 @@ static void pad_keep_system_buttons(GCController *c) {
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
-// The players' raw HID motion source follows the controllers (gone: one just removed, still listed): a Pro Controller's or a DualShock 4's, each model counted on its own
+// The players' raw HID motion and Pro stick fallback follow the controllers (gone: one just removed, still listed): a Pro Controller's or a DualShock 4's, each model counted on its own
 // (motion_pro_mac.h)
+static int pro_gc_player(GCController *c) { return g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c); }
+static int pro_gc_sticks(int player, int nz[2]) {
+    GCController *c = g_pro_gc;
+    if (!c || !c.extendedGamepad || pad_gc_unread(c) || pro_gc_player(c) != player) return 0;
+    nz[0] = pro_gc_stick_nonzero(c, 0); nz[1] = pro_gc_stick_nonzero(c, 1);
+    return 1;
+}
+static void pro_stick_changed(int player) {
+    GCController *c = g_pro_gc;
+    if (!c || pro_gc_player(c) != player) c = g_pro_gc_prev;
+    if (!c || c == g_pro_gc_gone || !c.extendedGamepad || pad_gc_unread(c) || pro_gc_player(c) != player) return;
+    if (![GCController.controllers containsObject:c]) return;
+    pad_read(c.extendedGamepad);
+}
 static void pads_motion_changed(GCController *gone) {
     int count[PRO_MODELS] = {0}, player[PRO_MODELS];
     for (int m = 0; m < PRO_MODELS; m++) player[m] = -1;
+    GCController *pro = nil;
     for (GCController *c in GCController.controllers) {
-        int m = c != gone && c.extendedGamepad ? pro_model_of_category(c.productCategory.UTF8String) : -1;
-        if (m >= 0) { count[m]++; player[m] = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c); }
+        int m = c != gone && c.extendedGamepad && !pad_gc_unread(c) ? pro_model_of_category(c.productCategory.UTF8String) : -1;
+        if (m >= 0) { count[m]++; player[m] = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)c); if (m == PRO_MODEL_PRO) pro = c; }
     }
+    g_pro_gc_prev = g_pro_gc; g_pro_gc = count[PRO_MODEL_PRO] == 1 ? pro : nil; g_pro_gc_gone = gone;
     dm_motion_pro_players(count, player);
+    g_pro_gc_prev = nil; g_pro_gc_gone = nil;
 }
 static void pro_devices_changed(void) { pads_motion_changed(nil); }
 // DM_PAD_PRESS_TO_JOIN=1: a controller is no player until one of its buttons is pressed, then it is the lowest player free, as a console's "press a button" screen.
@@ -761,7 +796,7 @@ static void pads_start(void) {
     hq_start();
     pads_changed(nil);
     hq_log_setting();
-    dm_motion_pro_start(pro_devices_changed);
+    dm_motion_pro_start(pro_devices_changed, pro_gc_sticks, pro_stick_changed);
     dm_jc1_start(g_merge);
     hidpad_start();
     static const dm_switch2_front s2front = {s2pad_attach, s2pad_detach, s2pad_read, s2pad_player, s2pad_blocked};
