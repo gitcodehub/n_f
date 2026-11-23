@@ -326,7 +326,7 @@ def shader_sources(imports, glsl_src, glslc_mods, spirv, unreal_paks, trinity_pa
                             f'{oodle_pkz} PlatinumGames PKZ archive(s) with Oodle Kraken entries (Bayonetta 3)' if oodle_pkz else
                             f'{oodle_gfpak} Game Freak GFPAK archive(s) with Oodle Kraken entries (Pokémon Legends: Arceus)' if oodle_gfpak else
                             f'{oodle_ttdat} TT Games CC4 DAT archive(s) with .nnx_shaders members (Skywalker Saga)' if oodle_ttdat else
-                            f'{anvil_forges} Anvil forge(s) (scimitar, Immortals Fenyx Rising), the shaders in their resources' if anvil_forges else
+                            f'{anvil_forges} Anvil forge(s) (scimitar: Immortals Fenyx Rising, Assassin\'s Creed: The Ezio Collection), the shaders in their resources' if anvil_forges else
                             f'{oodle_ue3} Unreal Engine 3 package(s) with Oodle-compressed chunks (Batman: Arkham Knight, its combined shader cache among them)') + ', Oodle-compressed: the shader split decodes them with the game\'s own decoder in the Mac host (dm/host/hle_oodle.c DM_OODLE_SERVE)'),
             'ue_legacy': (not vulkan and not gl and bool(legacy_paks), f'{legacy_paks} Unreal pak(s) with the shaders inline in the cooked packages (legacy, version 4, UE 4.18: DRAGON QUEST XI S, LZ5, decoded by the game\'s own decoder in the Mac host, dm/host/hle_oodle.c DM_OODLE_SERVE; '
                           'version 11 without shader code archives, UE 4.27: OCTOPATH TRAVELER II, Zlib, or with the cooked packages in an IoStore container beside it: Mario & Luigi: Brothership, Oodle): the shader split reads them file by file')}
@@ -343,6 +343,22 @@ def romfs_nro_imports(romfs):   # the names the loose NROs in a RomFS import (th
 
 
 UE3_TAG = bytes.fromhex('c1832a9e')   # an Unreal package's tag (shader_split.py ue3_package)
+
+
+def ue3_oodle_package(h):
+    """True when the prefix of a UE3 package (shader_split.py ue3_package) starts its first compressed chunk with an Oodle block (0x8c), for 32-bit or 64-bit chunk headers"""
+    if h[:4] != UE3_TAG or len(h) < 6 or not 0 < struct.unpack_from('<H', h, 4)[0] < 0x8000: return False
+    i = h.find(UE3_TAG, 4)
+    if i <= 0 or i + 16 > len(h): return False
+    word, fmt = (8, '<QQQ') if h[i:i + 8] == UE3_TAG + bytes(4) else (4, '<III')
+    if i + 4 * word > len(h): return False
+    bs, _, us = struct.unpack_from(fmt, h, i + word)
+    if not bs or not us: return False
+    nb = (us + bs - 1) // bs
+    off = i + 4 * word + 2 * word * nb
+    if off >= len(h): return False
+    c0, u0 = struct.unpack_from('<QQ' if word == 8 else '<II', h, i + 4 * word)
+    return c0 != u0 and h[off:off + 1] == b'\x8c'
 
 
 def romfs_glsl_files(romfs):
@@ -408,15 +424,10 @@ def build_sources(exefs, romfs, modules):
     oodle_ue3 = 0   # Unreal Engine 3 packages (shader_split.py ue3_package) whose first compressed block, found within the first 4 KB, is an Oodle one (8C; Batman: Arkham Knight): decoded with the game's own decoder
     for d, _, names in os.walk(romfs):
         for n in names:
-            with open(os.path.join(d, n), 'rb') as f: h = f.read(0x1000)
-            if h[:4] != UE3_TAG or not 0 < struct.unpack_from('<H', h, 4)[0] < 0x8000: continue
-            i = h.find(UE3_TAG, 4)
-            if 0 < i and i + 16 <= len(h):
-                nb = (struct.unpack_from('<I', h, i + 12)[0] + max(struct.unpack_from('<I', h, i + 4)[0], 1) - 1) // max(struct.unpack_from('<I', h, i + 4)[0], 1)
-                oodle_ue3 += h[i + 16 + 8 * nb:i + 17 + 8 * nb] == b'\x8c'
+            with open(os.path.join(d, n), 'rb') as f: oodle_ue3 += ue3_oodle_package(f.read(0x1000))
     import ttdat
     oodle_ttdat = sum(ttdat.needs_oodle(os.path.join(d, n)) for d, _, names in os.walk(romfs) for n in names if n.lower().endswith('.dat'))
-    anvil_forges = 0   # Ubisoft Anvil forges ('scimitar\0', Immortals Fenyx Rising): every file's containers are Oodle, decoded with the game's own decoder (shader_split.py forge_jobs)
+    anvil_forges = 0   # Ubisoft Anvil / Scimitar forges ('scimitar\0', Immortals Fenyx Rising, The Ezio Collection): every entry's blocks are Oodle, decoded with the game's own decoder (shader_split.py forge_jobs)
     for d, _, names in os.walk(romfs):
         for n in names:
             if n.endswith('.forge'):
