@@ -2122,8 +2122,9 @@ static int window_active(const win_t *o) { return o->nactive > 0 && o->nactive <
 NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     const win_builder_t *s = (const win_builder_t *)b; win_t *o = (win_t *)w;
     memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native; o->ntex = s->ntex; o->interval = s->interval; o->nactive = s->nactive;
+    o->offscreen = dm_native_window_offscreen(s->native);
     memcpy(o->tex, s->tex, sizeof o->tex);
-    LOG("[nvn] WindowInitialize swap chain %d textures (%d active), interval %d, first %dx%d format %#x", o->ntex, window_active(o), o->interval,
+    LOG("[nvn] WindowInitialize %sswap chain %d textures (%d active), interval %d, first %dx%d format %#x", o->offscreen ? "off-screen " : "", o->ntex, window_active(o), o->interval,
         o->ntex && o->tex[0] ? (int)CTX(o->tex[0])->d.width : 0, o->ntex && o->tex[0] ? (int)CTX(o->tex[0])->d.height : 0, o->ntex && o->tex[0] ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
@@ -2397,6 +2398,12 @@ static int acq_wait_run(acq_wait_t *aw, uint64_t timeout_ns, int *waited, uint64
 }
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
+    if (o->offscreen) {   // nothing shows its frames, so nothing holds a texture: free once the commands before this point are done
+        int n = window_active(o);
+        *idx = n ? o->next++ % n : 0;
+        if (s) nvn_sync_set_acq_fence((sync_t *)s, mtl_last_fence());
+        return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
+    }
     // If a prior deferred acquire on this window was never waited on via CPU nvnSyncWait (e.g. only nvnQueueWaitSync), drain its pacing & ticket wait now so pacing stays one wait per frame
     pthread_mutex_lock(&acq_mu);
     acq_wait_t *prev = (acq_wait_t *)o->pending_acq;
@@ -3258,6 +3265,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    if (o->offscreen) return;   // dropped (nvnWindowInitialize)
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     int movie = dm_movie_hz();
@@ -3290,7 +3298,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     }
     gfx_enter();
     uint64_t t0 = now_ns();
+    int presented = 0;
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
+        presented = 1;
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         uint64_t new_tk = nvn_queue_present((queue_t *)q, t, present_period(o) / 1e9, crop);
         pthread_mutex_lock(&acq_mu);
@@ -3379,7 +3389,6 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
-    { void dm_vi_frame_queued(uint64_t); dm_vi_frame_queued(g_frame); }   // the layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber
     if (g_frame % TWIN == 0) tsummary(g_frame);
     // GPU replay carries the submitted frame, even when a later CPU frame is already queued.
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
@@ -3396,6 +3405,13 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t slot = now;   // a frame the display link paced (or nothing did) is shown from its present on, and the beat follows it (nvn_pace_follow)
     if (follow) nvn_pace_follow(&pc, now); else slot += nvn_pace(&pc, now, period);
     o->pace = pc.target;
+    // The layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber: when the host pacer drives a vsync grid (!DM_DETCLOCK, !follow, period > 0, g_hz > 0), pass the
+    // present time, the pacer's vsync target and one vsync tick so frames with no Metal presentedTime (headless) flip on that grid instead of at first read. Under DM_DETCLOCK,
+    // display-link pacing (nvn_pace_follow: pc.target is just `now`), or unpaced presents (period 0), there is no pacer grid (pass 0) and the first-seen fallback stays.
+    { void dm_vi_frame_queued(uint64_t, uint64_t, uint64_t, uint64_t); void dm_vi_frame_ticket(uint64_t, uint64_t);
+      int paced = !dm_detclock_enabled() && !follow && period > 0 && g_hz > 0;
+      dm_vi_frame_queued(g_frame, paced ? now : 0, paced ? pc.target : 0, paced ? 1000000000ull / (uint64_t)g_hz : 0);
+      if (!presented) dm_vi_frame_ticket(g_frame, 0); }
     if (idx >= 0 && idx < 4) { pthread_mutex_lock(&acq_mu); o->avail[idx] = period ? slot + period : 0; pthread_mutex_unlock(&acq_mu); }
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded

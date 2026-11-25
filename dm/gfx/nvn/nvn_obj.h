@@ -72,7 +72,7 @@ typedef struct { uint32_t magic; volatile uint32_t *val; const pool_t *pool; int
 typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; int32_t nactive; } win_builder_t;
 FITS(win_builder_t, NVNwindowBuilder);
 // avail[i]: time at which swapchain image i can be acquired again (ns, monotonic clock) = its display time + one present period; pace: target time of this window's present pacer
-typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; int32_t nactive, follow; void *pending_acq; } win_t;   // ticket[i]: ticket of the most recent present of image i; nactive as in win_builder_t; follow: see nvn_pace_follow; pending_acq: deferred acquire wait not yet consumed
+typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4], offscreen; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; int32_t nactive, follow; void *pending_acq; } win_t;   // ticket[i]: ticket of the most recent present of image i; nactive as in win_builder_t; follow: see nvn_pace_follow; pending_acq: deferred acquire wait not yet consumed
 FITS(win_t, NVNwindow);
 
 // Command buffer: commands are written into the command memory given by the game (AddCommandMemory), and the list that strings a recording's pieces together into its control memory
@@ -318,6 +318,7 @@ double mtl_gpu_ms(uint64_t f);
 void mtl_ab_gpu(uint64_t f, double gpu_ms, double frame_ms);   // DM_AB phases (nvn_mtl.m)
 void xv_test_counts(int *dc, int *viol);
 int mtl_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1);   // The frame's earliest GPUStart / latest GPUEnd (mach absolute time, ns); returns 0 if not all complete or there is no GPU time
+int mtl_gpu_done(uint64_t f, uint64_t *t1);   // 1 when all of frame f's command buffers completed (latest GPUEnd in *t1, 0 if none had a time), 0 while running, -1 if no record
 void mtl_stats(uint64_t *passes, uint64_t *draws);
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch);
 void mtl_use_stats(uint64_t *call, uint64_t *skip);
