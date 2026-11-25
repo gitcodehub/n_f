@@ -4,6 +4,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 
 ## Frame step
 
+### Invalid GPU completion times inflate frame diagnostics
+
+- **Symptom:** after a GPU address fault, a frame's diagnostic GPU time is trillions of milliseconds while adjacent frames report ordinary timings.
+- **Cause:** `gpu_tag_done` accepted any positive duration with a positive start, and `up_flush` (`g_upload_gpu_ns`) accepted any positive duration. Missing or corrupt completion feedback (for example an unwritten `UINT64_MAX` tick sentinel converted through Apple Silicon's `125/3` timebase, ~`6.15e9` s, on a faulted command buffer) could supply a non-finite or future endpoint, poisoning the summed duration (`mtl_gpu_ms`, `@upload_gpu_ms`), the frame span (`mtl_gpu_span`), and `mtl_gpu_done` (`vfh_vsync`).
+- **Fix:** `gpu_time_valid` (`nvn_mtl.m`) accepts only finite, positive, ordered endpoints that have elapsed on Metal's host clock (`CACurrentMediaTime`), shared by `gpu_tag_done` and `up_flush`. Invalid feedback still retires its pending completion, but adds neither duration nor span; valid work in the same frame remains counted. This changes timing accumulation, not GPU execution or fault recovery.
+- **Check:** `t_gpu_timing` (missing, negative, reversed, equal, NaN, infinite, future, and #1737-magnitude endpoints; mixed valid/invalid frames across `mtl_gpu_ms`, `mtl_gpu_span`, and `mtl_gpu_done`; ring slot reuse).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game), [issue #1737](https://github.com/seedds/nxnative/issues/1737). The underlying intermittent GPU address fault remains open.
+
 ### Frame cap checked and used from the same sample
 
 - **Symptom:** clang reports division by zero in `fstep_tick` (`hle_nvn.c`).
@@ -214,6 +222,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** general, by the game's NVN: `nvnDeviceInitialize` sets `nvn_timestamp_ns` from `dm_sdk_ounce` (NVN2 is the Switch 2's SDK's), and `nvn_timestamp.h`'s two conversions, which all report writes (`gpu_ticks`, `rep_ticks`) and `nvnDeviceGetTimestampInNanoseconds` share, are then the identity. Games that read reports through the API see no change.
 - **Found on:** [Nintendo Switch 2 Welcome Tour](../../dm/games/040057C02159A000/README.md), whose Bezel profiler reads each pass's and each frame's GPU time through `nn::gfx` and feeds it to dynamic resolution: a probe read the frame regions 9-10 ms apart at 60 fps, the timestamps at 0.6144 of the guest clock; with the fix the regions lie 16.7-18 ms apart, 12-50 ms behind the guest clock, and the frame's GPU time (7.47 ms) matches the host's GPU p50 (7.53 ms).
 - **Check:** `t_timestamp`: with `nvn_timestamp_ns` set both conversions are the identity and `nn::gfx`'s raw difference reads a 60 fps frame as 16.67 ms; the 614.4 MHz report gave 10.24 ms.
+
+### A feedback time read in its own clock tick counted as in the future
+
+- **Symptom:** `t_counter_clock`'s check "feedback conversion uses the resumed guest epoch" failed intermittently (`gpu_s_guest_ns` returned 0, unknown). In a game, a counter report whose completion handler reads the clock in the same tick as the command buffer's `GPUStartTime` or `GPUEndTime` fell back as if that GPU time were unknown (GitHub issue [#1896](https://github.com/seedds/nxnative/issues/1896)).
+- **Cause:** `gpu_s_guest_ns` (`nvn_mtl.m`) took the age of a feedback time as `(double)now - s * 1e9`. Clang contracts that line into a fused multiply-subtract (`fmsub`), so `s * 1e9` is not rounded to a double, and for about half of all times its exact product lies a fraction of a nanosecond above the integer `now` of the same clock tick (mach time steps 41.67 ns at 24 MHz). In addition, `now_ns()` truncates `ticks * 125 / 3` while Metal's `CFTimeInterval` rounds in floating point. The age came out just below 0 and the time was rejected as in the future.
+- **Fix:** `gpu_s_guest_ns_at` (`nvn_mtl.m`) converts the feedback time to integer nanoseconds with `llround(s * 1e9)` (rejecting NaN, infinity, non-positive values, and times `>= 9e9` s past `int64_t` nanosecond range) and allows up to two double ULPs plus 1 ns ahead of `now` as same-tick slack, clamping such times to `age = 0`.
+- **Check:** `t_counter_clock` converts 20,000 live same-tick reads (none unknown) plus deterministic `gpu_s_guest_ns_at` boundary checks: one double step ahead of `now`, 24 MHz truncated-vs-float same-tick and one-step-ahead checks at 100 days uptime, rejection just past slack, and rejection of `0`, `-1`, `9.5e9`, `NAN`, and `INFINITY`.
+- **Found on:** the unit test (`t_counter_clock`), on an M5 Max (3 of 20 runs), an M4 (6 of 40), and local reproduction (5–9% of runs); no game report.
 
 ### The Switch 2's system tick is 31.25 MHz
 
