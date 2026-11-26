@@ -1,5 +1,6 @@
 """NSP script reuse across derived and provisional builds. Real fingerprints and mock tool runs; no game files, keys or Xcode needed."""
 import collections
+import hashlib
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -821,6 +823,30 @@ class SplitShaders(Base):
         k2 = self.go(g)
         self.assertEqual((self.splits, k2), (1, k1))   # the key stored after the tables were written: the second run sees the same inputs
 
+    def test_split_shaders_computes_package_key_once_per_hit_rebuild_or_replacement(self):
+        g = self.own()
+        calls = 0
+        real_pkg_key = nsp.package_key
+        def counting_pkg_key(pkg):
+            nonlocal calls
+            calls += 1
+            return real_pkg_key(pkg)
+        with mock.patch.object(nsp, 'package_key', side_effect=counting_pkg_key):
+            # Fresh split: package_key computed once on the installed output.
+            k1 = self.go(g)
+            self.assertEqual(calls, 1)
+            # Valid reuse hit: package_key computed once.
+            k2 = self.go(g)
+            self.assertEqual((calls, k2), (2, k1))
+            # Replaced/tampered package triggers rebuild: 1 check on stale pkg + 1 on freshly installed output.
+            (self.pkg / 'a.bin').write_bytes(b'tampered')
+            k3 = self.go(g)
+            self.assertEqual((calls, k3), (4, k1))
+            # Disabled key (e.g. key=None): no package_key computation and returns None.
+            with mock.patch.object(nsp, 'fingerprint', return_value=None):
+                self.assertIsNone(self.go(g))
+            self.assertEqual(calls, 4)
+
     def test_translation_and_profile_metadata_changes_keep_extraction(self):
         g = self.own(); before = self.go(g)
         for name in ('dmsh_build.py', 'dmsh_chain.py', 'pso_offline.py', 'unrelated_reader.py'):
@@ -960,6 +986,20 @@ class SplitShaders(Base):
         self.assertIn('2 file(s) unreadable', nsp.PROG.end.call_args[0][0])   # the reused split still names them
         for n in self.NAMES[:3]: (self.src / n).write_text(self.table(n))
         with self.assertRaisesRegex(nsp.BuildError, r'^2 file\(s\) could not be read'): self.go(game.Game(self.src), own=False)
+
+    def test_allow_damaged_registered_split_still_requires_matching_tables(self):
+        self.log = '[RED] 1 file(s) could not be read (first: archive: bad compressed texture)\nshaders: 3 (3 vertex)\n'
+        for n in self.NAMES: (self.src / n).write_text(self.table(n))
+        g = game.Game(self.src)
+        with mock.patch.object(nsp, 'ALLOW_DAMAGED', True):
+            self.go(g, own=False)
+            self.go(g, own=False)
+            self.assertEqual(self.splits, 1)
+            self.rows = 'missing shader'; (self.ex / 'RomFS/b.bin').write_bytes(b'changed')
+            with self.assertRaisesRegex(nsp.BuildError, 'differ from game profile'):
+                self.go(g, own=False)
+        with self.assertRaisesRegex(nsp.BuildError, r'^1 file\(s\) could not be read'):
+            self.go(g, own=False)
 
     def test_mode_is_in_the_key(self):   # the same files split as an own profile, then checked against them as a registered one
         g = self.own(); self.go(g)
@@ -1273,8 +1313,10 @@ class LayerShaders(Base):
         logs = self.tmp / 'logs'; logs.mkdir(); runs = []
         def translate(cmd, log, **kw):
             api = Path(cmd[1]).stem.split('_')[0]
-            lib = Path(cmd[-1]) / api / f'{api}_shaders.metallib'
-            lib.parent.mkdir(parents=True); lib.write_bytes(b'library')
+            out = Path(cmd[-1]) / api
+            out.mkdir(parents=True)
+            (out / f'{api}_shaders.metallib').write_bytes(b'library')
+            (out / f'{api}_shaders.tsv').write_text('# table\n')
             Path(log).write_text('macosx: 1\n'); runs.append(api)
         with mock.patch.object(nsp, 'run', side_effect=translate), mock.patch.object(nsp, 'toolchain', return_value=()), \
              mock.patch.object(nsp.shutil, 'which', return_value='/glslangValidator'), \
@@ -1298,6 +1340,104 @@ class LayerShaders(Base):
         self.assertTrue(nsp.gl_table_only_main(tsv))
         tsv.write_text('# GL shader ABI 2\n0123456789abcdef\tfrag\tr:-1:0\tmain#0\nfedcba9876543210\tfrag\tr:-1:0\t/shaders/sprite.glsl\n')
         self.assertFalse(nsp.gl_table_only_main(tsv))
+
+    def test_packed_gl_romfs_img_invalidates_and_reuses_with_controls(self):
+        import romfs_image
+        self.derive(); g = game.Game(self.pdir)
+        logs = self.tmp / 'logs'; logs.mkdir(); runs = []
+        def translate(cmd, log, **kw):
+            out = Path(cmd[-1]) / 'gl'
+            out.mkdir(parents=True, exist_ok=True)
+            (out / 'gl_shaders.metallib').write_bytes(b'library')
+            (out / 'gl_shaders.tsv').write_text('# GL shader ABI 3\n')
+            Path(log).write_text('macosx: 1\n'); runs.append(cmd)
+        src = self.tmp / 'gl_src'; (src / 'shaders').mkdir(parents=True)
+        (src / 'shaders/a.frag').write_text('#version 330\nvoid main() {}\n')
+        img = self.ex / 'RomFS.img'
+        romfs_image.pack(src, img)
+        loose = self.tmp / 'gl_loose'; (loose / 'shaders').mkdir(parents=True)
+        (loose / 'shaders/a.frag').write_text('#version 330\nvoid main() {}\n')
+        with mock.patch.object(nsp, 'run', side_effect=translate), mock.patch.object(nsp, 'toolchain', return_value=()), \
+             mock.patch.object(nsp.shutil, 'which', return_value='/glslangValidator'), \
+             mock.patch.object(nsp.subprocess, 'run', return_value=mock.Mock(stdout='compiler', stderr='')):
+            for prov in (False, True):
+                with self.subTest(provisional=prov):
+                    sh = self.tmp / f'gl-img-{prov}'
+                    roots = [nsp.rfs.Path(img), self.ex / 'ExeFS/main']
+                    def go(): nsp.build_gl_shaders(sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=prov)
+                    runs.clear()
+                    go(); self.assertEqual(len(runs), 1)
+                    go(); self.assertEqual(len(runs), 1)   # untouched image reuses
+                    (src / 'shaders/b.frag').write_text('#version 330\nvoid main() {}\n')
+                    romfs_image.pack(src, img)
+                    go(); self.assertEqual(len(runs), 2)   # added GLSL file repacked to same path triggers rebuild
+                    go(); self.assertEqual(len(runs), 2)
+            # Controls: loose directory and ExeFS/main
+            sh_loose = self.tmp / 'gl-loose'
+            lroots = [loose, self.ex / 'ExeFS/main']
+            runs.clear()
+            nsp.build_gl_shaders(sys.executable, REPO, lroots, sh_loose, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False)
+            nsp.build_gl_shaders(sys.executable, REPO, lroots, sh_loose, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False)
+            self.assertEqual(len(runs), 1)
+            (loose / 'shaders/b.frag').write_text('#version 330\nvoid main() {}\n')
+            nsp.build_gl_shaders(sys.executable, REPO, lroots, sh_loose, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False)
+            self.assertEqual(len(runs), 2)
+            nso(self.ex / 'ExeFS/main', BID)
+            nsp.build_gl_shaders(sys.executable, REPO, lroots, sh_loose, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False)
+            self.assertEqual(len(runs), 3)
+
+    def test_replacing_packed_dlc_equal_length_shader_rebuilds_registered_build(self):
+        import romfs_image
+        self.derive(); g = game.Game(self.pdir)
+        logs = self.tmp / 'logs'; logs.mkdir(); runs = []
+        def translate(cmd, log, **kw):
+            api = Path(cmd[1]).stem.split('_')[0]
+            out = Path(cmd[-1]) / api
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f'{api}_shaders.metallib').write_bytes(b'library')
+            (out / f'{api}_shaders.tsv').write_text('# table\n')
+            Path(log).write_text('macosx: 1\n'); runs.append(cmd)
+        base_src = self.tmp / 'base_romfs'; (base_src / 'shaders').mkdir(parents=True)
+        (base_src / 'shaders/base.frag').write_text('#version 330\nvoid main(){int b=0;}\n')
+        base_img = self.ex / 'RomFS.img'
+        romfs_image.pack(base_src, base_img)
+        with mock.patch.object(nsp, 'run', side_effect=translate), mock.patch.object(nsp, 'toolchain', return_value=()), \
+             mock.patch.object(nsp.shutil, 'which', return_value='/glslangValidator'), \
+             mock.patch.object(nsp.subprocess, 'run', return_value=mock.Mock(stdout='compiler', stderr='')):
+            cases = (
+                ('gl', nsp.build_gl_shaders, 'shaders/dlc.frag', b'#version 330\nvoid main(){int a=1;}\n', b'#version 330\nvoid main(){int b=2;}\n'),
+                ('vk', nsp.build_vk_shaders, 'shaders/dlc.spv', b'\x03\x02\x23\x07AAAA', b'\x03\x02\x23\x07BBBB'),
+            )
+            for api, build, rel, first, second in cases:
+                self.assertEqual(len(first), len(second))
+                with self.subTest(api=api):
+                    dlc_src = self.tmp / f'{api}_dlc_src'; (dlc_src / 'shaders').mkdir(parents=True)
+                    (dlc_src / rel).write_bytes(first)
+                    dlc_img = self.tmp / f'{api}_aoc/1.img'; dlc_img.parent.mkdir(parents=True)
+                    romfs_image.pack(dlc_src, dlc_img)
+                    sh = self.tmp / f'{api}-dlc-img'
+                    roots = [nsp.rfs.Path(base_img), self.ex / 'ExeFS/main']
+                    def go(dlc_list, build=build, roots=roots, sh=sh):
+                        build(sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False, dlc_roms=dlc_list)
+                    runs.clear()
+                    go([dlc_img]); self.assertEqual(len(runs), 1)
+                    self.assertIn(dlc_img, runs[-1])
+                    go([dlc_img]); self.assertEqual(len(runs), 1)   # unchanged image reuses
+                    (dlc_src / rel).write_bytes(second)
+                    romfs_image.pack(dlc_src, dlc_img)
+                    go([dlc_img]); self.assertEqual(len(runs), 2)   # equal-length replacement rebuilds once
+                    go([dlc_img]); self.assertEqual(len(runs), 2)   # following unchanged run reuses
+                    moved = dlc_img.with_name('2.img'); dlc_img.rename(moved)
+                    go([moved]); self.assertEqual(len(runs), 3)     # DLC index change invalidates even with identical bytes
+                    go([moved]); self.assertEqual(len(runs), 3)
+                    # Loose DLC directory control: equal-length replacement with fresh mtime also rebuilds once
+                    loose_dlc = self.tmp / f'{api}_aoc_loose/1'; (loose_dlc / 'shaders').mkdir(parents=True)
+                    (loose_dlc / rel).write_bytes(first)
+                    go([loose_dlc]); self.assertEqual(len(runs), 4)
+                    go([loose_dlc]); self.assertEqual(len(runs), 4)
+                    (loose_dlc / rel).write_bytes(second); self.redump(loose_dlc / rel)
+                    go([loose_dlc]); self.assertEqual(len(runs), 5)
+                    go([loose_dlc]); self.assertEqual(len(runs), 5)
 
 
 class MacApp(Base):
@@ -1606,6 +1746,54 @@ class DlcDecoderSources(unittest.TestCase):
         with mock.patch.object(nsp, 'dlc_decoder_sources', side_effect=AssertionError('should not scan DLC when base already triggers Oodle')):
             cap, _, _ = run_to_split(make_img(25), base_oodle=True)
             self.assertIsNotNone(cap['oodle'])
+
+
+class StreamedFingerprints(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp)
+
+    def _ref_files_fp(self, paths):
+        h = hashlib.sha256()
+        h.update(b'\0files\0')
+        for p in map(nsp.rfs.Path, paths):
+            h.update(p.name.encode() + b'\0')
+            try: h.update(hashlib.sha256(p.read_bytes()).digest())
+            except OSError: h.update(b'missing')
+        return h.hexdigest()
+
+    def test_streamed_fingerprint_matches_whole_file_and_missing_error_handling(self):
+        import romfs_image
+        empty = self.tmp / 'empty.bin'; empty.write_bytes(b'')
+        loose = self.tmp / 'loose.bin'; loose.write_bytes(b'hello-' * 500000)
+        missing = self.tmp / 'does_not_exist.bin'
+        src = self.tmp / 'rsrc'; src.mkdir()
+        (src / 'in_img.bin').write_bytes(b'romfs-data-' * 120000)
+        (src / 'img_empty.bin').write_bytes(b'')
+        img = self.tmp / 'RomFS.img'; romfs_image.pack(src, img)
+        paths = [empty, missing, loose, nsp.rfs.Path(img / 'in_img.bin'), nsp.rfs.Path(img / 'img_empty.bin'), nsp.rfs.Path(img / 'missing.bin')]
+        self.assertEqual(nsp.fingerprint(('files', paths)), self._ref_files_fp(paths))
+
+        # An OSError mid-stream must still produce the exact missing-file digest without corrupting the outer hash.
+        expected_missing = self._ref_files_fp([self.tmp / 'nonexistent' / loose.name])
+        class FailingStream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n): raise OSError('disk read error')
+        with mock.patch.object(nsp.rfs, 'open', return_value=FailingStream()):
+            self.assertEqual(nsp.fingerprint(('files', [loose])), expected_missing)
+
+    def test_streamed_fingerprint_has_bounded_peak_allocation(self):
+        big = self.tmp / 'big.bin'
+        big.write_bytes(b'x' * (6 << 20))
+        tracemalloc.start()
+        try:
+            tracemalloc.clear_traces()
+            digest = nsp.fingerprint(('files', [big]))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(digest, self._ref_files_fp([big]))
+        self.assertLess(peak, 3 << 20)
 
 
 if __name__ == '__main__': unittest.main()

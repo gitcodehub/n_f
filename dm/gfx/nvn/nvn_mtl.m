@@ -3330,6 +3330,7 @@ uint64_t mtl_sub_commit(void) {
     vc_commit();   // and the texture views of the textures the owner has let go, those evictions among them
     treg_res_check();   // DM_RES_CHECK=1: check live bindless descriptor views and note their allocations for late-retire checks
     treg_finish_submission();   // Late descriptor views retire behind this submission's fence.
+    void dlss_retire_drain(void); dlss_retire_drain();   // finalized DLSS networks' scalers retire behind this submission's fence
     rt_preserve_bound();   // The game may reuse completed command memory; queue bindings must not point into its texture snapshots.
     queue_program_preserve(); // Submitted metadata may retire while these programs remain bound.
     uint64_t fence = ++g_fence;
@@ -3995,7 +3996,7 @@ static inline void tex_lsize(const tex_t *t, unsigned l, uint32_t *w, uint32_t *
 static void tex_zero_fill(id<MTLTexture> mt);
 static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextureUsage add, MTLPixelFormat view_pf) {
     id holder = tex_get(t->serial);
-    // The serial holds an sRGB / linear view (tex_mtl_) of the asked texture, or the asked texture is that view: the parent is upgraded and the view made again on it, so the pair keeps sharing its bytes
+    // A serial may hold a storage-sharing view of the asked texture, or the asked texture may be that view. Rebuild the view on the upgraded parent with its original mip range.
     id<MTLTexture> view = ![holder isKindOfClass:[NvPkg class]] && obj_is_tex(holder) && ((id<MTLTexture>)holder).parentTexture
         && (holder == asked || ((id<MTLTexture>)holder).parentTexture == asked) ? holder : nil;
     id<MTLTexture> base = view ? view.parentTexture : asked;
@@ -4038,9 +4039,9 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         // the old texture is retired once the submissions that used it complete, the view caches follow g_ser_gen (PR #107). An sRGB / linear twin's view is made again on the upgraded
         // texture first and published in the rename's hold (own_upgrade), so no reader finds the serial's old view once its parent has left the sharing table
         if (view) {
-            upgraded_view = [upgraded newTextureViewWithPixelFormat:view.pixelFormat textureType:view.textureType levels:NSMakeRange(0, upgraded.mipmapLevelCount) slices:NSMakeRange(0, upgraded.arrayLength) swizzle:view.swizzle];
-            static int nview; if (nview++ < 4) MLOG("sRGB / linear view ser=%llu made again on its upgraded parent (%d so far)", (unsigned long long)t->serial, nview);
-            if (!upgraded_view) RED_ONCE(151, "cannot make the sRGB / linear view ser=%llu again on its upgraded parent: it keeps the old storage", (unsigned long long)t->serial);
+            upgraded_view = [upgraded newTextureViewWithPixelFormat:view.pixelFormat textureType:view.textureType levels:NSMakeRange(0, view.mipmapLevelCount) slices:NSMakeRange(0, upgraded.arrayLength) swizzle:view.swizzle];
+            static int nview; if (nview++ < 4) MLOG("storage-sharing view ser=%llu made again on its upgraded parent (%d so far)", (unsigned long long)t->serial, nview);
+            if (!upgraded_view) RED_ONCE(151, "cannot make the storage-sharing view ser=%llu again on its upgraded parent: it keeps the old storage", (unsigned long long)t->serial);
         }
         own_upgrade(base, upgraded, t->serial, view ? upgraded_view : upgraded);   // the serial tables, the pins and the sharing table, a new epoch (nvn_owner.m)
         ua_upgrade(base, upgraded);
@@ -5278,27 +5279,52 @@ static int storage_float_size(MTLPixelFormat pf) {   // element size in bytes, 0
         default: return 0;
     }
 }
-static int storage_has_nonfinite(const tex_t *t, MTLPixelFormat pf) {
-    int size = storage_float_size(pf);
-    if (!size) return 0;
-    const uint8_t *p = t->mem;
+static int span_has_nonfinite(const uint8_t *p, size_t n, void *ctx) {
+    MTLPixelFormat pf = *(const MTLPixelFormat *)ctx;
     if (pf == MTLPixelFormatRG11B10Float) {
-        for (size_t i = 0; i + 4 <= t->L.size; i += 4) {
+        for (size_t i = 0; i + 4 <= n; i += 4) {
             uint32_t v; memcpy(&v, p + i, 4);
             if (((v >> 6) & 31) == 31 || ((v >> 17) & 31) == 31 || ((v >> 27) & 31) == 31) return 1;
         }
         return 0;
     }
-    if (size == 2) {
-        for (size_t i = 0; i + 2 <= t->L.size; i += 2) {
+    if (storage_float_size(pf) == 2) {
+        for (size_t i = 0; i + 2 <= n; i += 2) {
             uint16_t v; memcpy(&v, p + i, 2);
             if ((v & 0x7c00) == 0x7c00) return 1;
         }
         return 0;
     }
-    for (size_t i = 0; i + 4 <= t->L.size; i += 4) {
+    for (size_t i = 0; i + 4 <= n; i += 4) {
         uint32_t v; memcpy(&v, p + i, 4);
         if ((v & 0x7f800000) == 0x7f800000) return 1;
+    }
+    return 0;
+}
+static int storage_has_nonfinite(const tex_t *t, id<MTLTexture> mt) {
+    MTLPixelFormat pf = mt.pixelFormat;
+    if (!storage_float_size(pf)) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) {
+        int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+        if (!bpb || bw != 1 || bh != 1) return 0;
+        uint32_t w, h, z; tex_lsize(t, 0, &w, &h, &z);
+        size_t pitch = (size_t)w * (size_t)bpb, srow = tex_linear_row(t);
+        if (z != 1 || srow < pitch || (uint64_t)srow * h > t->L.size) return 0;
+        const uint8_t *p = t->mem;
+        for (uint32_t r = 0; r < h; r++)
+            if (span_has_nonfinite(p + (size_t)r * srow, pitch, &pf)) return 1;
+        return 0;
+    }
+    unsigned levels = (unsigned)mt.mipmapLevelCount;
+    unsigned max_levels = t->d.levels ? t->d.levels : 1;
+    if (levels > max_levels) levels = max_levels;
+    unsigned layers = t->L.layers ? t->L.layers : 1;
+    for (unsigned l = 0; l < levels; l++) {
+        for (unsigned y = 0; y < layers; y++) {
+            int rc = nvn_deswizzle_visit(&t->d, l, y, t->mem, span_has_nonfinite, &pf);
+            if (rc > 0) return 1;
+            if (rc < 0) return 0;
+        }
     }
     return 0;
 }
@@ -5314,7 +5340,7 @@ static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
     if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread() || !mem_any(t->mem, t->L.size)) return 0;   // the upload batch belongs to the submit thread
     static int stale_keep = -1; if (stale_keep < 0) { const char *e = getenv("DM_NVN_STALE_FLOAT"); stale_keep = e && atoi(e) == 1; }
-    if (no_cpu && !stale_keep && storage_has_nonfinite(t, mt.pixelFormat)) {
+    if (no_cpu && !stale_keep && storage_has_nonfinite(t, mt)) {
         static uint64_t ns;
         if (ns++ < 8 || !(ns & (ns - 1))) MLOG("initial content: ser=%llu %ux%ux%u format %#x: its storage holds non-finite float texels; starts from zeros (%llu so far; DM_NVN_STALE_FLOAT=1 keeps it)",
                                                (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)ns);
@@ -6535,6 +6561,38 @@ static const uint8_t *srgb_twins(uint32_t f) {
     });
     return f < 256 ? tw[f] : tw[0];
 }
+// A shorter mip chain can describe the same leading levels of a block-linear 2D texture.
+// STORM 3 records uploads and then reinitializes the texture with fewer levels at the same pool offset before submitting.
+static id<MTLTexture> tex_mip_prefix(const tex_t *t, const alias_key *key) {
+    if (!t->mem || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+        (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) ||
+        t->d.target != NVN_TEXTURE_TARGET_2D || !fmt_compressed(t->d.format) ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return nil;
+
+    NSUInteger levels = MAX(t->d.levels, 1u);
+    __block id<MTLTexture> parent = nil;
+    __block alias_key parent_key;
+    pthread_mutex_lock(&g_smu);
+    own_alias_at_locked(t->pool, t->off, ^(const alias_key *k, id shared) {
+        if (parent || k->d.levels <= levels) return;
+        nvn_texdesc d = k->d;
+        d.levels = key->d.levels;
+        if (memcmp(&d, &key->d, sizeof d)) return;
+        nvn_texlayout layout;
+        nvn_tex_layout(&k->d, &layout);
+        if (layout.tileH != t->L.tileH || layout.tileD != t->L.tileD) return;
+        id<MTLTexture> base = shared;
+        if (base.mipmapLevelCount < levels) return;
+        parent = base;
+        parent_key = *k;
+    });
+    pthread_mutex_unlock(&g_smu);
+    if (!parent) return nil;
+
+    id<MTLTexture> view = [parent newTextureViewWithPixelFormat:parent.pixelFormat textureType:parent.textureType
+                                                       levels:NSMakeRange(0, levels) slices:NSMakeRange(0, 1) swizzle:parent.swizzle];
+    return view && own_view_put(t->serial, &parent_key, view) ? view : nil;
+}
 // The usage of a buffer texture's view: every use the guest may make of it, whatever its IMAGE flag. A view on its pool's buffer has no lossless compression for the write and
 // format-view usages to cost (measured on an M6: reads of R32F, R32UI, RGBA8, RGBA16F and RGBA32F views over 64 MB the same with and without them, within run-to-run noise), and
 // its NVN texture objects share one view (tex_mtl_), the IMAGE ones among them: made with read usage alone, the first image write or format view of a view another object made
@@ -6756,7 +6814,7 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         return tex_mtl_result(pk->view ? pk->view : pk->tex, owned);
     }
     if ([have isKindOfClass:[NvPkg class]]) have = nil;   // a movie texture dropped back to non-packaged (e.g. buffer-backed linear): rebuild as an MTLTexture below
-    // An sRGB / linear view whose parent left the sharing table (upgraded, or evicted with its pool; a takeover leaves a held view's parent) no longer shares the storage's bytes: dropped,
+    // A view whose parent left the sharing table (upgraded, or evicted with its pool; a takeover leaves a held view's parent) no longer shares the storage's bytes: dropped,
     // live or finalized (its ghost entry), and made again below on what holds them now. serial_del took only a live entry, so a finalized serial kept resolving to the stale view
     // whenever making the new texture failed, and to any thread in between
     if (obj_is_tex(have) && ((id<MTLTexture>)have).parentTexture && own_view_drop_stale(t->serial, have)) {
@@ -6786,6 +6844,8 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
         if (got != mt) defer_obj_release(mt);   // another thread registered one over the same storage meanwhile: that one is shared
         return tex_mtl_result(got, owned);
     }
+    id<MTLTexture> prefix = tex_mip_prefix(t, &ak);
+    if (prefix) { if (!g_pool_walk) tu_stamp(prefix, 0); return tex_mtl_result(prefix, owned); }
     {   // NVN textures over the same storage share its bytes. One that differs from a shared texture only by the other format of an sRGB / linear pair is a view of it: as its own Metal
         // texture, Mario Kart World's Grand Prix movie (an RGBA8 render target the YUV pass writes, sampled by the composite through an RGBA8_SRGB texture) showed a frozen frame
         // The other formats of the pair are looked up directly (srgb_twins), with the rest of the key unchanged; the descriptor is built only when one is shared
@@ -7071,8 +7131,7 @@ static inline int passdump(void) {
 void dm_gfx_passdump_next(long n) { long f = (long)atomic_load(&g_cur_frame); g_pd_a1 = f + n; g_pd_a0 = f + 1; }
 #define PD(...) do { if (passdump()) { flockfile(stderr); fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); funlockfile(stderr); } } while (0)
 static void blit_note(void) { if (g_enc) PD("E %llu copy / buffer update ends the render pass", g_stat_pass); }
-__attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c provides the strong definition (DM_DETCLOCK deterministic guest clock); a no-op when graphics unit tests do not link the host   // diag.c provides the strong definition (DM_TICK_HOLD=E:SHOT unfreeze); a no-op when graphics unit tests do not link the host
-__attribute__((weak)) void dm_cheats_present(void) {}   // hle_cheats.c provides the strong definition (the Atmosphère cheat pass per presented frame); a no-op when graphics unit tests do not link the host
+__attribute__((weak)) void dm_guest_frame_tick(void) {}   // hle_os.c provides the strong definition (DM_DETCLOCK + per-frame cheats); a no-op when graphics unit tests do not link the host
 __attribute__((weak)) int dm_detclock_enabled(void) { return 0; }   // Same as above: the host's hle_os.c provides the strong definition; when graphics unit tests do not link the host, the deterministic clock is treated as off
 // The guest clock when graphics unit tests do not link the host (hle_os.c): now_ns, as the host's is with no pause and no deterministic clock, whatever clock the test gives now_ns
 // (bp_now's is the host's). Counter reports map GPU timestamps and feedback times through it; stubs that returned 0 sent every report to the time of its completion handler, so two
@@ -20806,11 +20865,11 @@ static void copy_t2t(const p_copy_t2t *c) {
 // vectors at the input's size, inverted depth, with 0x40 for its DLSSAutoExposure). Where MetalFX takes no scaler for the formats, or a depth or motion texture is missing, the input is scaled
 // bilinearly into the output with a red line: the frame stays whole, without the temporal gain
 enum { DLSS_F_DEPTH_INVERTED = 1 << 3, DLSS_F_AUTO_EXPOSURE = 1 << 6 };
-// The networks are named by their serials (hle_nvn.c nvnDlssNetworkInitialize), so one made again in the same memory is another network here. A scaler replaced (new sizes, or its
-// slot taken by another network: nvnDlssNetworkFinalize tells the replay nothing, and Fast Fusion had made 8 networks by its 9th minute) is held until this submission completes
+// The networks are named by their serials (hle_nvn.c nvnDlssNetworkInitialize), so one made again in the same memory is another network here. A scaler retired on
+// nvnDlssNetworkFinalize (mtl_dlss_forget) or evicted when the cache is full (Fast Fusion had made 8 networks by its 9th minute) is held until this submission completes
 // (defer_obj_release): a Metal 4 command buffer does not retain what is encoded into it, and the network's earlier evaluations in the submission still use it. Dropped at once, the
-// commit crashed in -[_MTL4MachineLearningCommandEncoder encodeToCommandQueue:] ("-[AGXG17XFamilyMLContext executable]: unrecognized selector"). A new network takes the slot used
-// least recently: slot 0 was always taken, which could be the network the game was drawing with.
+// commit crashed in -[_MTL4MachineLearningCommandEncoder encodeToCommandQueue:] ("-[AGXG17XFamilyMLContext executable]: unrecognized selector"). When all slots are full, a new
+// entry takes the slot used least recently: slot 0 was always taken, which could be the network the game was drawing with.
 // A scaler is keyed by the textures' sizes, not by the input's: NVN2 reports a range of inputs (hle_nvn.c nvnDlssNetworkBuilderGetOptimalSettings), and a game with a dynamic resolution
 // renders a new size into the same textures as often as each frame. MetalFX's input content properties take that: the scaler's input is the textures' common size, its content scale
 // runs from that size's (the content filling them; no less than the device's least) up to the most the device takes, and each evaluation sets its own content size. Keyed by the input's size, every new size made
@@ -20849,19 +20908,70 @@ static id<MTLRenderPipelineState> dlss_alpha_pso(MTLPixelFormat pf) {
     return ps;
 }
 
-typedef struct { uint64_t net, used; id<MTL4FXTemporalScaler> sc; NSUInteger key[10]; float lo, hi; int fresh, mask; } dlss_scaler;
-static dlss_scaler g_dlss[4];
+// One scaler per network and input box, not one per network: a game with dynamic resolution renders into textures of a few sizes and steps between them every few
+// seconds, and each synchronous build stalls the replay about 80 ms (Xenoblade Chronicles DE, 0400FF500E34A001: 1280x720 to 960x540, 191 builds and 190 frames of
+// about 88 ms in 5 minutes of play). A kept scaler that becomes the network's current one again starts with a reset, as a new one does: its history is from another size.
+// Finalized networks (mtl_dlss_forget) drop all their cached scalers via deferred release on the replay thread so dead networks do not pin GPU memory across slots.
+typedef struct { uint64_t net, used; id<MTL4FXTemporalScaler> sc; NSUInteger key[10]; float lo, hi; int fresh, mask, cur; } dlss_scaler;
+#define DLSS_KEEP 12
+static dlss_scaler g_dlss[DLSS_KEEP];
 static uint64_t g_dlss_use;
 static id<MTL4Compiler> g_dlss_comp;
 static void dlss_scaler_drop(dlss_scaler *e) { if (e->sc) defer_obj_release(e->sc); e->sc = nil; }
+static pthread_mutex_t g_dlss_retire_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t *g_dlss_retire;
+static size_t g_dlss_retire_n, g_dlss_retire_cap;
+static _Atomic size_t g_dlss_retire_pending;
+void mtl_dlss_forget(uint64_t serial) {
+    if (!serial) return;
+    pthread_mutex_lock(&g_dlss_retire_mu);
+    if (g_dlss_retire_n == g_dlss_retire_cap) {
+        size_t ncap = g_dlss_retire_cap ? g_dlss_retire_cap * 2 : 16;
+        uint64_t *p = realloc(g_dlss_retire, ncap * sizeof *p);
+        if (!p) { pthread_mutex_unlock(&g_dlss_retire_mu); return; }
+        g_dlss_retire = p; g_dlss_retire_cap = ncap;
+    }
+    g_dlss_retire[g_dlss_retire_n++] = serial;
+    atomic_store_explicit(&g_dlss_retire_pending, g_dlss_retire_n, memory_order_release);
+    pthread_mutex_unlock(&g_dlss_retire_mu);
+}
+void dlss_retire_drain(void) {
+    if (!atomic_load_explicit(&g_dlss_retire_pending, memory_order_acquire)) return;
+    for (;;) {
+        uint64_t batch[16]; size_t n = 0;
+        pthread_mutex_lock(&g_dlss_retire_mu);
+        n = g_dlss_retire_n < 16 ? g_dlss_retire_n : 16;
+        if (n) {
+            memcpy(batch, g_dlss_retire, n * sizeof *batch);
+            g_dlss_retire_n -= n;
+            if (g_dlss_retire_n) memmove(g_dlss_retire, g_dlss_retire + n, g_dlss_retire_n * sizeof *batch);
+        }
+        atomic_store_explicit(&g_dlss_retire_pending, g_dlss_retire_n, memory_order_release);
+        pthread_mutex_unlock(&g_dlss_retire_mu);
+        if (!n) break;
+        for (size_t k = 0; k < n; k++) for (int i = 0; i < DLSS_KEEP; i++) {
+            if (g_dlss[i].net != batch[k]) continue;
+            dlss_scaler_drop(&g_dlss[i]);
+            g_dlss[i].net = 0; g_dlss[i].used = 0; g_dlss[i].lo = g_dlss[i].hi = 0; g_dlss[i].fresh = g_dlss[i].mask = g_dlss[i].cur = 0;
+            memset(g_dlss[i].key, 0, sizeof g_dlss[i].key);
+        }
+    }
+}
 static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLTexture> dep, id<MTLTexture> mot, id<MTLTexture> out, id<MTLTexture> bias, NSUInteger iw, NSUInteger ih) {
+    dlss_retire_drain();
     NSUInteger bw = MIN(col.width, MIN(dep.width, mot.width)), bh = MIN(col.height, MIN(dep.height, mot.height));   // the input box every texture holds
     if (bias) { bw = MIN(bw, bias.width); bh = MIN(bh, bias.height); }
     NSUInteger key[10] = {col.pixelFormat, dep.pixelFormat, mot.pixelFormat, out.pixelFormat, bias ? bias.pixelFormat : 0, bw, bh, out.width, out.height, c->flags};
     float s_lo = MIN((float)out.width / (float)iw, (float)out.height / (float)ih), s_hi = MAX((float)out.width / (float)iw, (float)out.height / (float)ih);   // this evaluation's scale
-    dlss_scaler *e = NULL, *spare = NULL;
-    for (int i = 0; i < 4 && !e; i++) { if (g_dlss[i].net == c->net) e = &g_dlss[i]; else if (!spare || (spare->net && (!g_dlss[i].net || g_dlss[i].used < spare->used))) spare = &g_dlss[i]; }
-    if (!e) { e = spare; e->net = c->net; dlss_scaler_drop(e); memset(e->key, 0, sizeof e->key); }
+    dlss_scaler *e = NULL, *spare = NULL, *prev = NULL;
+    for (int i = 0; i < DLSS_KEEP; i++) {
+        dlss_scaler *s = &g_dlss[i];
+        if (s->net == c->net && s->net && s->cur) prev = s;
+        if (!e && s->net == c->net && s->net && !memcmp(s->key, key, sizeof key)) e = s;
+        else if (!spare || (spare->net && (!s->net || s->used < spare->used))) spare = s;
+    }
+    if (!e) { e = spare; if (e == prev) prev = NULL; e->net = c->net; dlss_scaler_drop(e); memset(e->key, 0, sizeof e->key); e->cur = 0; }
+    if (e != prev) { if (prev) prev->cur = 0; e->cur = 1; e->fresh = 1; }   // back to a kept scaler: its history is another size's
     e->used = ++g_dlss_use;
     if (!memcmp(e->key, key, sizeof key) && (!e->sc || (s_lo >= e->lo && s_hi <= e->hi))) return e->sc ? e : NULL;
     memcpy(e->key, key, sizeof key); dlss_scaler_drop(e); e->fresh = 1;
@@ -20873,6 +20983,12 @@ static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLT
     d.colorTextureFormat = col.pixelFormat; d.depthTextureFormat = dep.pixelFormat; d.motionTextureFormat = mot.pixelFormat; d.outputTextureFormat = out.pixelFormat;
     d.inputWidth = bw; d.inputHeight = bh; d.outputWidth = out.width; d.outputHeight = out.height;
     d.autoExposureEnabled = (c->flags & DLSS_F_AUTO_EXPOSURE) != 0;
+    // Build the final upscaler now, not in the background. With the default (NO), MetalFX hands back an interim upscaler and swaps in the one it compiles behind it; on
+    // Xenoblade Chronicles: Definitive Edition – Nintendo Switch 2 Edition (0400FF500E34A001, 2.0.0; M2 Pro, macOS 27.3 26C5035r) that swap failed every run on the 97th
+    // evaluation of the fourth scaler the game's dynamic resolution made in its first second: MPSGraph's ANE region asserted `ANE inference operation failed`
+    // (Code=-19, inferenceCount 96) and aborted; with MTL_ERROR_MODE=nslog the GPU command buffer waiting on that inference timed out instead and macOS revoked GPU
+    // access. Built synchronously, the same boot ran 2,697 evaluations to its time limit, and the frames that make the scalers took no longer
+    d.requiresSynchronousInitialization = YES;
     d.inputContentPropertiesEnabled = YES; d.inputContentMinScale = e->lo; d.inputContentMaxScale = e->hi;
     const int fx = g_dlss_comp && [MTLFXTemporalScalerDescriptor supportsMetal4FX:g_dev];
     e->mask = bias != nil;
@@ -21988,8 +22104,8 @@ static id<MTLTexture> present_raw_src(id<MTLTexture> src) {
 // differs from the game's, e.g. iPhone about 19.5:9 against the game's 16:9); when the ratios differ by under 1 % (the remainder from a game width that is a multiple of 8 in the
 // full-screen setup, e.g. 1952x900 against 2868x1320 differs by 0.17 %) the whole canvas, leaving no border of a few pixels
 static MTLViewport present_viewport(double pw, double ph, double dw, double dh) {
-    double s = fmin(dw / pw, dh / ph);
-    MTLViewport vp = {floor((dw - pw * s) / 2), floor((dh - ph * s) / 2), round(pw * s), round(ph * s), 0, 1};
+    double s = fmin(dw / pw, dh / ph), w = round(pw * s), h = round(ph * s);   // the size first: pw * s can land a hair over the canvas (1600 * 1710 / 1600 = 1710.0000000000002) and floor of half the negative rest put the picture at x = -1, its first column off the left edge
+    MTLViewport vp = {floor((dw - w) / 2), floor((dh - h) / 2), w, h, 0, 1};
     if (fabs((dw / dh) / (pw / ph) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
     return vp;
 }
