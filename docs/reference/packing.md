@@ -178,6 +178,13 @@
 - **Fix:** `dmsh_build.py` now flushes the final count of `cache check` and `compiling`, flushes immediately on every step change, reports `compiling mesh libraries` across `_mesh`, passes an `on_progress` callback through `publish_library` to `shader_lib.write` for `writing the library image` (or `writing the Mac library image` and `writing the iOS library image` on dual-image builds, with file counts and bytes written), and reports `c1 guard` and `uniform read extents` before unlinking `DMSH_PROGRESS` at exit. `ShaderWatch` reads `step`, counts, unit and formatted bytes directly from `DMSH_PROGRESS`.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) v131072 on an M3 Max ([PR #2684](https://github.com/seedds/nxnative/pull/2684)). Checked in `dm/tools/tests/test_shader_lib.py` (`test_write_reports_progress`), `dm/tools/tests/test_nsp_mac.py` (`test_shader_watch_follows_all_phases`) and `dm/tools/tests/test_shader_toolchain_cache.py` (`BuildProgress`).
 
+### A comma in the build path stops the shader split
+
+- **Symptom:** `shader_split.py` stops with `FileNotFoundError` naming only the part of the NSP folder before a comma.
+- **Cause:** the NSP script joined the RomFS, ExeFS and DLC paths with commas, and the splitter used the same character to separate the paths for each game version.
+- **Fix:** the NSP script sends each path list as a JSON array. The direct splitter CLI still accepts its original comma-separated arguments. A synthetic base, update and DLC under a path with a comma verify that all three shader sources reach the split.
+- **Found on:** [Pokémon: Let's Go, Pikachu!](../../dm/games/010003F003A34000/README.md#found-on-this-game) 1.0.2 (`010003F003A34000`).
+
 ### The split shader tables differ from a game profile's
 
 - **Symptom:** the shader split stops with `the split shader tables differ from game profile <id>'s`, on the game version the profile registers.
@@ -893,6 +900,14 @@
 - **Cause:** the base game's HtmlDocument NCA can be sparse too (16 KB, beside the sparse Program NCA). `--html` reads the update's HtmlDocument NCAs, each over a base one when it is a patch, and then every base HtmlDocument NCA on its own; a sparse one read alone fails the hash check while its tables open.
 - **Fix:** `dm/tools/nx_extract/Program.cs` reads no sparse base HtmlDocument NCA on its own (`a sparse HtmlDocument NCA of the base game (… bytes): read only through the update's patch, not alone`), as Horizon mounts it only through its patch.
 - **Found on:** [Minecraft Dungeons II](../../dm/games/0100A7C01B792000/README.md), base v0 with update v131072: the update's patch (`accessible-urls`) and its full legal information NCA are read, the base's legal information NCA too.
+
+### Offline pages of a sparse base game are incomplete without its update patch
+
+- **Symptom:** `nx_extract --html` on a base NSP with no update (or an update that does not patch its sparse Manual NCA) prints `a sparse HtmlDocument NCA of the base game (16384 bytes): read only through the update's patch, not alone`, writes only the non-sparse Manual NCAs (`1 HtmlDocument NCAs`) and exits 0, although the sparse HtmlDocument pages are missing.
+- **Cause:** the sparse-base skip above skipped every sparse base Manual NCA unconditionally without checking whether an update patch actually read through that base NCA. Without an update, or when the update only ships an unrelated full Manual NCA (such as LegalInformation) or patches a different base NCA, nothing supplied the sparse NCA's pages.
+- **Fix:** `dm/tools/nx_extract/Program.cs` (`ExtractHtml`) records the exact base Manual NCAs that an update patch successfully read through (`patched`). A sparse base Manual NCA is skipped only when it is in `patched`; otherwise `--html` removes any partial `html<n>` folders it created, prints `[RED] a sparse HtmlDocument NCA of the base game (… bytes) has no update patch to read it through: its pages are missing; pack the base game with its update NSP`, and stops with exit code 4 (the code a sparse base Program NCA without its update already returns). Non-sparse bases and updates whose patch matches the sparse base read identically to before.
+- **Check:** `dm/tools/tests/test_pfs0_storage.py` (`CheckSparseHtmlExtraction` in `Pfs0StorageTests.cs`) covers base-only sparse extraction (including end-to-end `--html` CLI on a synthetic NSP), an unrelated full update Manual NCA, a patch matching a different base NCA, a failed patch alongside a full update NCA, a second unpatched sparse base, a matching patch (3 directories, exit 0), and a non-sparse base alone.
+- **Found on:** [Minecraft Dungeons II](../../dm/games/0100A7C01B792000/README.md), base v0 without its update ([PR #1769](https://github.com/seedds/nxnative/pull/1769)): base-only extraction previously wrote 14 files in one directory and exited 0, against 29 files in three directories with update v131072.
 
 ### Unreal 4.27 shaders with 8-byte hashes, an untagged record or a version 12 pak
 
